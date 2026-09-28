@@ -131,7 +131,7 @@ static void test_pid_step_response(void)
 
     CHECK_MSG(axxpid_test_near(r.final_value, 200, AXXPID_C(0.5)),
               "settled at %.2f instead of 200", (double)r.final_value);
-    CHECK_MSG(r.peak < AXXPID_C(230), "overshoot to %.1f exceeds 15%%",
+    CHECK_MSG(r.peak < AXXPID_C(222), "overshoot to %.1f exceeds 11%%",
               (double)r.peak);
     CHECK_MSG(r.settled && (r.settle_time < 120),
               "settled at %.1f s (-1 means never)", (double)r.settle_time);
@@ -294,7 +294,7 @@ static void test_velocity_feedforward_tracks_a_ramp(void)
         }
     }
 
-    CHECK_MSG(lag_assisted < lag_plain * AXXPID_C(0.5),
+    CHECK_MSG(lag_assisted < lag_plain * AXXPID_C(0.1),
               "velocity feed-forward barely helped: %.2f vs %.2f",
               (double)lag_assisted, (double)lag_plain);
 }
@@ -454,6 +454,10 @@ static void test_antiwindup_none_integrates_through_saturation(void)
 
     (void)axxpid_init(&pid, 0, 2, 0, 0, 10);
     (void)axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_NONE, 1);
+    /* Opt out of the derived integral limits: this measures what happens with
+     * no anti-windup, not what happens with a clamp. */
+    (void)axxpid_set_integral_limits(&pid, -AXXPID_UNLIMITED,
+                                     AXXPID_UNLIMITED);
 
     /* No protection at all means exactly ki*e*dt every sample, limit or no
      * limit: 2 * 100 * 0.1 * 50 = 1000. */

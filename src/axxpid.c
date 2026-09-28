@@ -151,6 +151,41 @@ static bool axxpid_config_is_valid(const axxpid_config_t *cfg)
     return true;
 }
 
+/** @brief Clamp a would-be integral value to the configured limits. */
+static axxpid_real_t axxpid_clamp_integral(const axxpid_t *pid,
+                                           axxpid_real_t value)
+{
+    return axxpid_clamp(value, pid->cfg.integral_min, pid->cfg.integral_max);
+}
+
+/**
+ * @brief Default integral limits for a given output range.
+ *
+ * Left unbounded, the integral is one wild sensor reading away from being
+ * stuck for good: a measurement of 4.3e9 where 50 was expected produces an
+ * integral around 1e11, and from there an ordinary step of a few units is
+ * smaller than that number's last floating-point bit, so it rounds away and
+ * the integrator can never come back. The loop sits at a limit forever.
+ *
+ * Ten output spans either side of the range is far more than any real
+ * controller needs - the integral only ever has to cancel the proportional
+ * term and cover the output range - while keeping the stored value somewhere
+ * a normal integral step can still walk it back from. Callers who want
+ * something tighter, and most should, say so with
+ * ::axxpid_set_integral_limits.
+ */
+static void axxpid_default_integral_limits(axxpid_config_t *cfg)
+{
+    const axxpid_real_t span = cfg->out_max - cfg->out_min;
+    const axxpid_real_t headroom = span * AXXPID_C(10);
+
+    if (!axxpid_is_finite(headroom)) {
+        return; /* Unbounded output range; nothing to derive from. */
+    }
+    cfg->integral_min = cfg->out_min - headroom;
+    cfg->integral_max = cfg->out_max + headroom;
+}
+
 /** @brief Clear every piece of runtime state, leaving the configuration alone. */
 static void axxpid_clear_state(axxpid_t *pid)
 {
@@ -162,8 +197,12 @@ static void axxpid_clear_state(axxpid_t *pid)
     pid->setpoint = 0;
     pid->measurement = 0;
 
-    pid->output = 0;
-    pid->manual_output = 0;
+    /* Zero is not necessarily a value this actuator can take. A valve that
+     * runs between 20% and 80% must start at 20, or the slew limiter spends
+     * the first seconds ramping up through outputs the caller was promised
+     * would never appear. */
+    pid->output = axxpid_clamp(0, pid->cfg.out_min, pid->cfg.out_max);
+    pid->manual_output = pid->output;
     pid->error = 0;
     pid->p_term = 0;
     pid->i_term = 0;
@@ -172,6 +211,7 @@ static void axxpid_clear_state(axxpid_t *pid)
     pid->saturated = false;
 
     pid->first_update = true;
+    pid->history_stale = true;
     pid->bumpless_pending = false;
     pid->has_time = false;
     pid->last_time_ms = 0u;
@@ -236,22 +276,33 @@ axxpid_status_t axxpid_init_config(axxpid_t *pid, const axxpid_config_t *cfg)
         return AXXPID_ERR_NULL;
     }
 
-    /* Install a safe controller first, whatever happens next.
+    /* Install a safe controller whatever happens next.
      *
      * Every other entry point leaves the instance untouched when it rejects
      * an argument, because there is prior state worth protecting. Here there
      * is none: an uninitialised axxpid_t holds a garbage ff_fn pointer that
      * the next update would call. A caller who ignores the return value has
      * to end up with a controller that does nothing, not one running on
-     * uninitialised memory. */
-    (void)axxpid_config_default(&pid->cfg);
-    axxpid_clear_state(pid);
-
+     * uninitialised memory.
+     *
+     * The configuration goes in before the state is cleared, because clearing
+     * needs the output limits to know where to start the output. */
     if (!axxpid_config_is_valid(cfg)) {
+        (void)axxpid_config_default(&pid->cfg);
+        axxpid_clear_state(pid);
         return AXXPID_ERR_PARAM;
     }
 
     pid->cfg = *cfg;
+
+    /* Only when the caller left them at the sentinel: an explicit choice,
+     * however wide, is always respected. */
+    if ((pid->cfg.integral_min <= -AXXPID_UNLIMITED) &&
+        (pid->cfg.integral_max >= AXXPID_UNLIMITED)) {
+        axxpid_default_integral_limits(&pid->cfg);
+    }
+
+    axxpid_clear_state(pid);
     return AXXPID_OK;
 }
 
@@ -374,7 +425,7 @@ static bool axxpid_compute(axxpid_t *pid,
      * interval, and report a derivative twice the real one. */
     if (!axxpid_is_finite(setpoint) || !axxpid_is_finite(measurement) ||
         !axxpid_is_finite(dt) || !(dt > 0)) {
-        pid->first_update = true;
+        pid->history_stale = true;
         return false;
     }
 
@@ -387,7 +438,7 @@ static bool axxpid_compute(axxpid_t *pid,
         dt = cfg->dt_max;
         dt_was_clamped = true;
     }
-    restart_history = pid->first_update || dt_was_clamped;
+    restart_history = pid->first_update || pid->history_stale || dt_was_clamped;
 
     direction = (cfg->acting == AXXPID_ACTING_REVERSE) ? AXXPID_C(-1)
                                                        : AXXPID_C(1);
@@ -430,6 +481,14 @@ static bool axxpid_compute(axxpid_t *pid,
         pid->d_filtered = 0;
     } else {
         d_raw = (d_input - pid->prev_d_input) / dt;
+
+        /* A huge jump over a tiny dt overflows to infinity. Left alone it
+         * would enter the filter, and the next sample's (inf - inf) would
+         * make the filter state NaN for the rest of the run. */
+        if (!axxpid_is_finite(d_raw)) {
+            d_raw = 0;
+            pid->d_filtered = 0;
+        }
     }
 
     tau = cfg->derivative_filter_tau;
@@ -447,6 +506,9 @@ static bool axxpid_compute(axxpid_t *pid,
          * not quietly move the cut-off frequency. */
         const axxpid_real_t alpha = dt / (tau + dt);
         pid->d_filtered += alpha * (d_raw - pid->d_filtered);
+        if (!axxpid_is_finite(pid->d_filtered)) {
+            pid->d_filtered = 0;
+        }
     } else {
         pid->d_filtered = d_raw;
     }
@@ -462,6 +524,13 @@ static bool axxpid_compute(axxpid_t *pid,
     if (cfg->ff_fn != (axxpid_ff_fn_t)0) {
         ff_term += cfg->ff_fn(setpoint, measurement, cfg->ff_user);
     }
+    if (!axxpid_is_finite(ff_term)) {
+        /* The feed-forward is summed into the output and into the integrator,
+         * so a bad value here is exactly as damaging as a bad measurement.
+         * Treat it the same way. */
+        pid->history_stale = true;
+        return false;
+    }
 
     /* Everything that does not depend on the integrator. Feed-forward is part
      * of it on purpose: the integrator must see the same output the actuator
@@ -475,8 +544,7 @@ static bool axxpid_compute(axxpid_t *pid,
 
         /* Keep the integrator at the value that would reproduce the manual
          * output, so returning to automatic is bumpless. */
-        pid->integral = axxpid_clamp(output - feedback_free,
-                                      cfg->integral_min, cfg->integral_max);
+        pid->integral = axxpid_clamp_integral(pid, output - feedback_free);
 
         pid->error = error;
         pid->p_input = p_input;
@@ -494,6 +562,7 @@ static bool axxpid_compute(axxpid_t *pid,
         pid->prev_setpoint = setpoint;
         pid->output = output;
         pid->first_update = false;
+        pid->history_stale = false;
         return true;
     }
 
@@ -508,9 +577,19 @@ static bool axxpid_compute(axxpid_t *pid,
          * unwind the difference. */
         const axxpid_real_t resume_from =
             axxpid_clamp(pid->manual_output, cfg->out_min, cfg->out_max);
+        const axxpid_real_t step_limit =
+            (cfg->out_max - cfg->out_min) * AXXPID_C(10);
+        axxpid_real_t target = resume_from - feedback_free;
 
-        pid->integral = axxpid_clamp(resume_from - feedback_free,
-                                      cfg->integral_min, cfg->integral_max);
+        /* The preload jumps straight to a value rather than stepping, so the
+         * per-sample bound below does not cover it. Bound it here instead: if
+         * this sample's measurement is nonsense, the proportional term is
+         * nonsense, and the preload computed from it would be too. */
+        if (axxpid_is_finite(step_limit)) {
+            target = axxpid_clamp(target, pid->integral - step_limit,
+                                  pid->integral + step_limit);
+        }
+        pid->integral = axxpid_clamp_integral(pid, target);
         pid->bumpless_pending = false;
     }
 
@@ -527,6 +606,22 @@ static bool axxpid_compute(axxpid_t *pid,
                        ? (cfg->ki * cfg->integral_overshoot_gain)
                        : cfg->ki;
     integral_step = ki_effective * error * dt;
+
+    /* No single sample may move the integral by more than ten times the
+     * output range. Ten is deliberately loose - it leaves even aggressively
+     * tuned loops untouched - but it is still five or six orders of magnitude
+     * below what one implausible reading produces, and that is the difference
+     * between an integrator that recovers in seconds and one that has been
+     * thrown somewhere it takes hours to walk back from. */
+    {
+        const axxpid_real_t step_limit =
+            (cfg->out_max - cfg->out_min) * AXXPID_C(10);
+
+        if (axxpid_is_finite(step_limit)) {
+            integral_step = axxpid_clamp(integral_step, -step_limit,
+                                         step_limit);
+        }
+    }
 
     if (cfg->antiwindup == AXXPID_ANTIWINDUP_CONDITIONAL) {
         /* Skip the step only if the output is already outside what the
@@ -570,20 +665,20 @@ static bool axxpid_compute(axxpid_t *pid,
     }
 
     /* Hard cap on the integral, applied whatever the anti-windup mode. */
-    pid->integral = axxpid_clamp(pid->integral, cfg->integral_min,
-                                  cfg->integral_max);
+    pid->integral = axxpid_clamp_integral(pid, pid->integral);
 
     /* The two overrides run last, so nothing else in this sample can put the
      * integrator back. */
     if (cfg->integral_reset_on_zero_setpoint && (setpoint == 0)) {
-        pid->integral = 0;
+        /* Clamped, not assigned: limits that exclude zero still hold. */
+        pid->integral = axxpid_clamp_integral(pid, 0);
         integral_forced_zero = true;
     }
 
     /* Integral engagement band: park the integrator while the process is
      * still far below the setpoint and the actuator is saturated anyway. */
     if (error > cfg->integral_band) {
-        pid->integral = 0;
+        pid->integral = axxpid_clamp_integral(pid, 0);
         integral_forced_zero = true;
     }
 
@@ -633,8 +728,7 @@ static bool axxpid_compute(axxpid_t *pid,
             tracking_gain = 1;
         }
         pid->integral += tracking_gain * (output - output_unsaturated);
-        pid->integral = axxpid_clamp(pid->integral, cfg->integral_min,
-                                      cfg->integral_max);
+        pid->integral = axxpid_clamp_integral(pid, pid->integral);
     }
 
     /* Remember this sample for the next derivative and velocity feed-forward. */
@@ -642,6 +736,7 @@ static bool axxpid_compute(axxpid_t *pid,
     pid->prev_setpoint = setpoint;
     pid->output = output;
     pid->first_update = false;
+    pid->history_stale = false;
 
     return true;
 }
@@ -816,9 +911,11 @@ axxpid_status_t axxpid_set_output_limits(axxpid_t *pid,
     pid->cfg.out_min = min;
     pid->cfg.out_max = max;
 
-    /* Bring the live state inside the new range immediately. */
+    /* Bring the live output inside the new range immediately. The manual
+     * output is deliberately left alone: it is clamped every time it is
+     * applied, so widening the limits again restores what the caller asked
+     * for rather than the clipped copy. */
     pid->output = axxpid_clamp(pid->output, min, max);
-    pid->manual_output = axxpid_clamp(pid->manual_output, min, max);
     return AXXPID_OK;
 }
 
@@ -842,8 +939,11 @@ axxpid_status_t axxpid_set_integral(axxpid_t *pid, axxpid_real_t value)
     if (!axxpid_is_finite(value)) {
         return AXXPID_ERR_PARAM;
     }
-    pid->integral = axxpid_clamp(value, pid->cfg.integral_min,
-                                  pid->cfg.integral_max);
+    pid->integral = axxpid_clamp_integral(pid, value);
+
+    /* A pending bumpless transfer would overwrite this on the next update.
+     * The caller has just been explicit about the value they want. */
+    pid->bumpless_pending = false;
     return AXXPID_OK;
 }
 
@@ -860,7 +960,7 @@ axxpid_status_t axxpid_set_integral_limits(axxpid_t *pid,
 
     pid->cfg.integral_min = min;
     pid->cfg.integral_max = max;
-    pid->integral = axxpid_clamp(pid->integral, min, max);
+    pid->integral = axxpid_clamp_integral(pid, pid->integral);
     return AXXPID_OK;
 }
 
@@ -871,12 +971,18 @@ axxpid_status_t axxpid_set_antiwindup(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
+    /* Checked in every mode, not just the one that uses it: storing an
+     * infinity here would leave a configuration that axxpid_init_config would
+     * refuse, which is a trap for anyone reading the config back out. */
+    if ((tracking_time != 0) && !axxpid_is_finite(tracking_time)) {
+        return AXXPID_ERR_PARAM;
+    }
     switch (mode) {
         case AXXPID_ANTIWINDUP_NONE:
         case AXXPID_ANTIWINDUP_CONDITIONAL:
             break;
         case AXXPID_ANTIWINDUP_BACK_CALCULATION:
-            if (!(tracking_time > 0) || !axxpid_is_finite(tracking_time)) {
+            if (!(tracking_time > 0)) {
                 return AXXPID_ERR_PARAM;
             }
             break;
@@ -975,7 +1081,7 @@ axxpid_status_t axxpid_set_setpoint_weights(axxpid_t *pid,
          * differencing across the change would report a step in the setpoint
          * as a one-sample spike in the rate of the measurement. Start the
          * derivative again instead. */
-        pid->first_update = true;
+        pid->history_stale = true;
     }
 
     pid->cfg.setpoint_weight_b = b;
@@ -1046,9 +1152,9 @@ axxpid_status_t axxpid_set_acting(axxpid_t *pid, axxpid_acting_t acting)
     if (acting != pid->cfg.acting) {
         /* The accumulated integral belongs to the old sense; keeping it would
          * drive the actuator hard the wrong way. */
-        pid->integral = 0;
+        pid->integral = axxpid_clamp_integral(pid, 0);
         pid->d_filtered = 0;
-        pid->first_update = true;
+        pid->history_stale = true;
     }
     pid->cfg.acting = acting;
     return AXXPID_OK;
@@ -1069,9 +1175,12 @@ axxpid_status_t axxpid_set_mode(axxpid_t *pid, axxpid_mode_t mode)
          * up exactly where the manual output left off. */
         pid->bumpless_pending = true;
     }
-    if (mode == AXXPID_MODE_MANUAL) {
+    if ((mode == AXXPID_MODE_MANUAL) &&
+        (pid->cfg.mode == AXXPID_MODE_AUTOMATIC)) {
         /* Capture the live output, so manual mode starts where automatic left
-         * off. Call axxpid_set_manual_output() afterwards to override it. */
+         * off. Call axxpid_set_manual_output() afterwards to override it.
+         * Only on a real transition: calling set_mode(MANUAL) twice must not
+         * throw away a manual output set in between. */
         pid->manual_output = pid->output;
     }
     pid->cfg.mode = mode;

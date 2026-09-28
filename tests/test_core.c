@@ -329,6 +329,17 @@ static void test_getters_and_terms(void)
 
     CHECK(axxpid_get_terms(&pid, &terms) == AXXPID_OK);
     CHECK(axxpid_get_terms(&pid, NULL) == AXXPID_ERR_NULL);
+    /* Against hand arithmetic, not against the same field read twice.
+     * kp=2, ki=3, kd=4. Sample 1: sp=10 pv=0 dt=0.1 -> I = 3*10*0.1 = 3,
+     * D = 0 (no history yet). Sample 2: sp=10 pv=2 -> e = 8, P = 16,
+     * I = 3 + 3*8*0.1 = 5.4, D = -4*(2-0)/0.1 = -80. */
+    CHECK_NEAR(terms.p, 16, AXXPID_C(1e-4));
+    CHECK_NEAR(terms.i, AXXPID_C(5.4), AXXPID_C(1e-4));
+    CHECK_NEAR(terms.d, -80, AXXPID_C(1e-3));
+    CHECK_NEAR(terms.ff, 0, AXXPID_C(1e-6));
+    CHECK_NEAR(terms.error, 8, AXXPID_C(1e-5));
+
+    /* And the single-value getters agree with the struct. */
     CHECK(terms.p == axxpid_get_p_term(&pid));
     CHECK(terms.i == axxpid_get_i_term(&pid));
     CHECK(terms.d == axxpid_get_d_term(&pid));

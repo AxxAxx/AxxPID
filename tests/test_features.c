@@ -184,6 +184,10 @@ static void test_antiwindup_conditional(void)
 
     (void)axxpid_init(&pid_open, 1, 5, 0, 0, 10);
     (void)axxpid_set_antiwindup(&pid_open, AXXPID_ANTIWINDUP_NONE, 1);
+    /* Opt out of the derived integral limits, so this measures the
+     * anti-windup strategy and nothing else. */
+    (void)axxpid_set_integral_limits(&pid_open, -AXXPID_UNLIMITED,
+                                     AXXPID_UNLIMITED);
 
     /* Hold a large error against a hard limit for 10 s. */
     for (i = 0; i < 100; ++i) {
@@ -212,34 +216,38 @@ static void test_antiwindup_conditional(void)
 static void test_conditional_integration_never_latches(void)
 {
     axxpid_t pid;
-    axxpid_real_t wound_up;
     int i;
 
-    /* A standing feed-forward of 100 holds the output at its upper limit on
-     * its own, so the loop stays saturated no matter what the integrator
-     * does - exactly the situation in which a naive rule latches. */
-    (void)axxpid_init(&pid, 1, 5, 0, 0, 100);
-    (void)axxpid_set_feedforward_bias(&pid, 100);
+    /* kp is zero on purpose. The integrator alone has to hold the output at
+     * its limit, so the sample where the error reverses is genuinely
+     * saturated *and* genuinely wants to integrate downwards - which is the
+     * one case a naive anti-windup rule refuses, latching the loop forever.
+     * With any proportional term the P contribution masks it, which is how
+     * the earlier version of this test came to prove nothing. */
+    (void)axxpid_init(&pid, 0, 5, 0, 0, 100);
     (void)axxpid_set_integral_limits(&pid, -200, 200);
+    CHECK(axxpid_set_integral(&pid, 150) == AXXPID_OK);
 
-    for (i = 0; i < 200; ++i) {
-        (void)axxpid_update(&pid, 50, 0, AXXPID_C(0.1));
-    }
-    wound_up = axxpid_get_i_term(&pid);
+    (void)axxpid_update(&pid, 10, 0, AXXPID_C(0.1));
     CHECK_NEAR(axxpid_get_output(&pid), 100, AXXPID_C(1e-4));
-    CHECK(axxpid_is_saturated(&pid));
+    CHECK_MSG(axxpid_is_saturated(&pid), "setup is not saturated");
 
-    /* Reverse the error. The output is still hard against the limit, but the
-     * integral step now reduces the saturation instead of deepening it, so it
-     * must be allowed through - every sample, monotonically. */
+    /* Error now negative, output still pinned at the top. The step reduces
+     * the saturation, so it must be taken - every sample, monotonically. */
     for (i = 0; i < 40; ++i) {
-        const axxpid_real_t previous = axxpid_get_i_term(&pid);
+        const axxpid_real_t previous = axxpid_get_integral(&pid);
+
         (void)axxpid_update(&pid, 0, 2, AXXPID_C(0.1));
-        CHECK_MSG(axxpid_get_i_term(&pid) < previous,
+        CHECK_MSG(axxpid_get_integral(&pid) < previous,
                   "integrator latched at %.2f while saturated",
-                  (double)axxpid_get_i_term(&pid));
+                  (double)axxpid_get_integral(&pid));
+        if (i < 8) {
+            /* Still pinned, so this is the saturated case, not a free run. */
+            CHECK_NEAR(axxpid_get_output(&pid), 100, AXXPID_C(1e-4));
+        }
     }
-    CHECK(axxpid_get_i_term(&pid) < wound_up - 20);
+    /* 40 samples at ki*e*dt = 5*2*0.1 = 1 per sample, from 150. */
+    CHECK_NEAR(axxpid_get_integral(&pid), 110, AXXPID_C(0.5));
 }
 
 /* The saturation test must key off which limit is exceeded, not off the sign
@@ -277,6 +285,8 @@ static void test_antiwindup_back_calculation(void)
     int i;
 
     (void)axxpid_init(&pid, 1, 5, 0, 0, 10);
+    (void)axxpid_set_integral_limits(&pid, -AXXPID_UNLIMITED,
+                                     AXXPID_UNLIMITED);
     CHECK(axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_BACK_CALCULATION,
                                 AXXPID_C(0.5)) == AXXPID_OK);
 
@@ -288,9 +298,10 @@ static void test_antiwindup_back_calculation(void)
      * ki*e*dt = (dt/Tt)*(u_sat - u_unsat), so u_unsat settles at
      * out_max + ki*e*Tt = 10 + 5*100*0.5 = 260, i.e. I settles near
      * 260 - kp*e = 260 - 100 = 160. Bounded, not unbounded. */
-    CHECK_MSG(axxpid_get_i_term(&pid) > 100 && axxpid_get_i_term(&pid) < 220,
-              "back-calculation integral settled at %.1f, expected ~160",
-              (double)axxpid_get_i_term(&pid));
+    /* The fixed point is exact: the charge ki*e*dt and the bleed
+     * (dt/Tt)*(u_sat - u_unsat) cancel, giving u_unsat = out_max + ki*e*Tt =
+     * 10 + 5*100*0.5 = 260, so I = 260 - kp*e = 260 - 100 = 160. */
+    CHECK_NEAR(axxpid_get_i_term(&pid), 160, AXXPID_C(1.0));
 
     /* Reverse the error and it comes off the limit in a handful of samples
      * rather than grinding through the accumulated wind-up. */
@@ -1086,6 +1097,469 @@ static void test_non_finite_integral_time_is_reported(void)
     CHECK(axxpid_get_ki(&pid) == 5);
 }
 
+/* -------------------------------------------------------------------------- */
+/* Gaps found by mutation testing                                             */
+/* -------------------------------------------------------------------------- */
+
+/* The filter time constant is Tf = (kd/kp)/N. Every earlier test used
+ * kp == kd, where inverting that ratio makes no difference at all. */
+static void test_derivative_filter_with_unequal_gains(void)
+{
+    axxpid_t pid;
+
+    /* kp=2, kd=8, N=4 -> Tf = (8/2)/4 = 1.0 s. With dt = 0.1 the filter
+     * passes alpha = 0.1/1.1 of each new sample. A step of 1 over 0.1 s is a
+     * raw rate of -10, so D = 8 * (-10) * (0.1/1.1) = -7.2727. Inverting the
+     * ratio to (kp/kd)/N would give Tf = 0.0625 and D = -49.5. */
+    (void)axxpid_init(&pid, 2, 0, 8, -1000, 1000);
+    (void)axxpid_set_derivative_filter(&pid, 4);
+
+    (void)axxpid_update(&pid, 0, 0, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 0, 1, AXXPID_C(0.1));
+    CHECK_NEAR(axxpid_get_d_term(&pid), AXXPID_C(-7.27273), AXXPID_C(1e-3));
+}
+
+/* With kp = 0 there is no derivative time to divide by, so the N-based filter
+ * cannot be computed and must simply not engage. */
+static void test_derivative_filter_with_zero_kp(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 0, 0, 1, -1000, 1000);
+    (void)axxpid_set_derivative_filter(&pid, 10);
+
+    (void)axxpid_update(&pid, 0, 0, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 0, 1, AXXPID_C(0.1));
+
+    /* Unfiltered: D = 1 * -(1/0.1) = -10. A divide by zero here would give
+     * tau = inf, alpha = 0, and D would silently be 0 forever. */
+    CHECK_NEAR(axxpid_get_d_term(&pid), -10, AXXPID_C(1e-4));
+}
+
+/* Bumpless retuning has to compensate the derivative term as well as the
+ * proportional one. The earlier test used kd = 0 and could not tell. */
+static void test_bumpless_retuning_compensates_the_derivative(void)
+{
+    axxpid_t pid;
+    axxpid_real_t before;
+    axxpid_real_t after;
+
+    (void)axxpid_init(&pid, 2, 1, 4, -10000, 10000);
+    (void)axxpid_set_bumpless_tuning(&pid, true);
+
+    /* A steady ramp in the measurement, so the D term is large and constant. */
+    (void)axxpid_update(&pid, 50, 0, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 50, 1, AXXPID_C(0.1));
+    before = axxpid_update(&pid, 50, 2, AXXPID_C(0.1));
+
+    /* Double kd. The D term doubles; the integral must absorb the change. */
+    CHECK(axxpid_set_tunings(&pid, 2, 1, 8) == AXXPID_OK);
+    after = axxpid_update(&pid, 50, 3, AXXPID_C(0.1));
+
+    CHECK_MSG(axxpid_test_near(after, before, AXXPID_C(5.0)),
+              "retune with kd active bumped the output from %.2f to %.2f",
+              (double)before, (double)after);
+}
+
+/* Manual mode must keep the derivative history current, or the first
+ * automatic sample differentiates across the whole manual period. */
+static void test_transfer_with_derivative_active(void)
+{
+    axxpid_t pid;
+    int i;
+
+    (void)axxpid_init(&pid, 0, 0, 1, -10000, 10000);
+    (void)axxpid_set_mode(&pid, AXXPID_MODE_MANUAL);
+    (void)axxpid_set_manual_output(&pid, 20);
+
+    /* The measurement ramps at 10 per second throughout. */
+    for (i = 0; i < 20; ++i) {
+        (void)axxpid_update(&pid, 0, (axxpid_real_t)i, AXXPID_C(0.1));
+    }
+
+    (void)axxpid_set_mode(&pid, AXXPID_MODE_AUTOMATIC);
+    (void)axxpid_update(&pid, 0, 20, AXXPID_C(0.1));
+
+    /* The ramp never changed, so D must still be -kd * 10 = -10. If manual
+     * mode had stopped tracking, the first automatic sample would difference
+     * against a two-second-old measurement. */
+    CHECK_NEAR(axxpid_get_d_term(&pid), -10, AXXPID_C(1e-3));
+}
+
+/* Switching to manual with no explicit value must hold the output where
+ * automatic left it. */
+static void test_manual_mode_captures_the_live_output(void)
+{
+    axxpid_t pid;
+    axxpid_real_t automatic;
+
+    (void)axxpid_init(&pid, 2, 0, 0, 0, 100);
+    automatic = axxpid_update(&pid, 30, 10, AXXPID_C(0.1));
+    CHECK_NEAR(automatic, 40, AXXPID_C(1e-4));
+
+    CHECK(axxpid_set_mode(&pid, AXXPID_MODE_MANUAL) == AXXPID_OK);
+    CHECK_MSG(axxpid_test_near(axxpid_get_output(&pid), automatic,
+                               AXXPID_C(1e-4)),
+              "going manual moved the output to %.2f",
+              (double)axxpid_get_output(&pid));
+    CHECK_NEAR(axxpid_update(&pid, 30, 0, AXXPID_C(0.1)), 40, AXXPID_C(1e-4));
+
+    /* And setting a manual value takes effect immediately, before any
+     * further update. */
+    CHECK(axxpid_set_manual_output(&pid, 12) == AXXPID_OK);
+    CHECK_NEAR(axxpid_get_output(&pid), 12, AXXPID_C(1e-5));
+
+    /* Asking for manual again must not discard that value. */
+    CHECK(axxpid_set_mode(&pid, AXXPID_MODE_MANUAL) == AXXPID_OK);
+    CHECK_NEAR(axxpid_update(&pid, 30, 0, AXXPID_C(0.1)), 12, AXXPID_C(1e-5));
+}
+
+/* Manual to automatic with no update in between still has to preload. */
+static void test_transfer_without_an_intervening_update(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 2, 0, 0, 0, 200);
+    (void)axxpid_set_mode(&pid, AXXPID_MODE_MANUAL);
+    (void)axxpid_set_manual_output(&pid, 55);
+    (void)axxpid_set_mode(&pid, AXXPID_MODE_AUTOMATIC);
+
+    /* No manual-mode update ever ran, so the preload on this first automatic
+     * sample is the only thing that can make it bumpless. */
+    CHECK_NEAR(axxpid_update(&pid, 100, 10, AXXPID_C(0.1)), 55,
+               AXXPID_C(1e-3));
+}
+
+/* Reverse acting has to apply to the setpoint-weighted part of the
+ * proportional term too, not only to the error. */
+static void test_reverse_acting_with_setpoint_weight(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 3, 0, 0, -1000, 1000);
+    (void)axxpid_set_acting(&pid, AXXPID_ACTING_REVERSE);
+    (void)axxpid_set_setpoint_weights(&pid, AXXPID_C(0.5), 0);
+
+    /* P = kp * dir * (b*sp - pv) = 3 * -1 * (0.5*10 - 14) = +27. Dropping the
+     * direction from the (1-b)*sp part instead gives -3. */
+    CHECK_NEAR(axxpid_update(&pid, 10, 14, AXXPID_C(0.1)), 27, AXXPID_C(1e-4));
+}
+
+/* The velocity feed-forward must restart across a capped sample for the same
+ * reason the derivative does. */
+static void test_velocity_feedforward_across_a_stall(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 0, 0, 0, -100000, 100000);
+    (void)axxpid_set_feedforward_gains(&pid, 0, 1);
+    (void)axxpid_set_dt_max(&pid, AXXPID_C(0.1));
+
+    (void)axxpid_update(&pid, 0, 0, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 1, 0, AXXPID_C(0.1));
+    CHECK_NEAR(axxpid_get_ff_term(&pid), 10, AXXPID_C(1e-3));
+
+    /* Ten seconds pass and the setpoint moves by 100. The real rate is 10 per
+     * second; dividing by the 0.1 s cap would claim 1000. */
+    (void)axxpid_update(&pid, 101, 0, 10);
+    CHECK_MSG(axxpid_test_near(axxpid_get_ff_term(&pid), 0, AXXPID_C(1e-3)),
+              "stall produced a velocity feed-forward of %.2f",
+              (double)axxpid_get_ff_term(&pid));
+}
+
+/* The saturation flag must report a slew limit too, not only the clamp. */
+static void test_saturated_reports_a_slew_limit_alone(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 1, 0, 0, -1000, 1000);
+    (void)axxpid_set_output_slew_rate(&pid, 10);
+
+    /* The law wants 100, well inside the limits, but the rate allows 1. */
+    CHECK_NEAR(axxpid_update(&pid, 100, 0, AXXPID_C(0.1)), 1, AXXPID_C(1e-4));
+    CHECK_MSG(axxpid_is_saturated(&pid),
+              "output was rate-limited but not reported as saturated");
+}
+
+/* Setters have to bring the live state with them. */
+static void test_setters_move_the_live_state(void)
+{
+    axxpid_t pid;
+
+    /* Tightening the integral limits pulls the stored integral in. */
+    (void)axxpid_init(&pid, 0, 1, 0, -1000, 1000);
+    (void)axxpid_update(&pid, 55, 0, 1);
+    CHECK_NEAR(axxpid_get_integral(&pid), 55, AXXPID_C(1e-4));
+    CHECK(axxpid_set_integral_limits(&pid, -20, 20) == AXXPID_OK);
+    CHECK_NEAR(axxpid_get_integral(&pid), 20, AXXPID_C(1e-4));
+
+    /* reset_to clamps to the output limits. */
+    (void)axxpid_init(&pid, 1, 0, 0, 0, 50);
+    CHECK(axxpid_reset_to(&pid, 999) == AXXPID_OK);
+    CHECK_NEAR(axxpid_get_output(&pid), 50, AXXPID_C(1e-5));
+}
+
+/* Equal integral limits pin the integral, which is the documented way to turn
+ * integral action off without touching ki. */
+static void test_equal_integral_limits_pin_the_integral(void)
+{
+    axxpid_t pid;
+    int i;
+
+    (void)axxpid_init(&pid, 1, 10, 0, -1000, 1000);
+    CHECK(axxpid_set_integral_limits(&pid, 7, 7) == AXXPID_OK);
+
+    for (i = 0; i < 20; ++i) {
+        (void)axxpid_update(&pid, 100, 0, AXXPID_C(0.1));
+        CHECK_NEAR(axxpid_get_integral(&pid), 7, AXXPID_C(1e-5));
+    }
+    for (i = 0; i < 20; ++i) {
+        (void)axxpid_update(&pid, -100, 0, AXXPID_C(0.1));
+        CHECK_NEAR(axxpid_get_integral(&pid), 7, AXXPID_C(1e-5));
+    }
+}
+
+/* axxpid_init_config validates the whole struct, so every field it checks
+ * needs to actually be checked. */
+static void test_init_config_rejects_every_bad_field(void)
+{
+    axxpid_t pid;
+    axxpid_config_t cfg;
+    size_t i;
+
+    for (i = 0; i < 11u; ++i) {
+        CHECK(axxpid_config_default(&cfg) == AXXPID_OK);
+        cfg.out_min = 0;
+        cfg.out_max = 100;
+
+        switch (i) {
+            case 0u: cfg.kp = -1; break;
+            case 1u: cfg.ki = -1; break;
+            case 2u: cfg.kd = -1; break;
+            case 3u: cfg.out_max = -1; break;
+            case 4u: cfg.integral_min = 10; cfg.integral_max = 1; break;
+            case 5u: cfg.deadband = -1; break;
+            case 6u: cfg.setpoint_weight_b = 2; break;
+            case 7u: cfg.setpoint_weight_c = -1; break;
+            case 8u: cfg.dt_max = 0; break;
+            case 9u: cfg.out_slew_rate = -1; break;
+            default: cfg.sample_time_ms = 0u; break;
+        }
+
+        CHECK_MSG(axxpid_init_config(&pid, &cfg) == AXXPID_ERR_PARAM,
+                  "init_config accepted bad field %u", (unsigned)i);
+    }
+
+    /* And the happy path really does take the values given. */
+    CHECK(axxpid_config_default(&cfg) == AXXPID_OK);
+    cfg.kp = 3;
+    cfg.out_min = -5;
+    cfg.out_max = 55;
+    cfg.deadband = 2;
+    cfg.setpoint_weight_b = AXXPID_C(0.5);
+    CHECK(axxpid_init_config(&pid, &cfg) == AXXPID_OK);
+    CHECK(axxpid_get_kp(&pid) == 3);
+    CHECK(pid.cfg.out_max == 55);
+    CHECK(pid.cfg.deadband == 2);
+}
+
+/* Exact threshold values, which no other test uses. */
+static void test_boundary_values(void)
+{
+    axxpid_t pid;
+
+    /* The overshoot gain applies strictly below the threshold, so an error
+     * exactly on it uses the plain gain. */
+    (void)axxpid_init(&pid, 0, 1, 0, -1000, 1000);
+    (void)axxpid_set_integral_overshoot(&pid, 10, -5);
+    (void)axxpid_update(&pid, 0, 5, 1);
+    CHECK_NEAR(axxpid_get_integral(&pid), -5, AXXPID_C(1e-4));
+
+    /* The band applies strictly above, so an error exactly on it integrates. */
+    (void)axxpid_init(&pid, 0, 1, 0, -1000, 1000);
+    (void)axxpid_set_integral_band(&pid, 10);
+    (void)axxpid_update(&pid, 10, 0, 1);
+    CHECK_NEAR(axxpid_get_integral(&pid), 10, AXXPID_C(1e-4));
+
+    /* A dt exactly at dt_max is not a stall, so the derivative still runs. */
+    (void)axxpid_init(&pid, 0, 0, 1, -1000, 1000);
+    (void)axxpid_set_dt_max(&pid, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 0, 0, AXXPID_C(0.1));
+    (void)axxpid_update(&pid, 0, 1, AXXPID_C(0.1));
+    CHECK_NEAR(axxpid_get_d_term(&pid), -10, AXXPID_C(1e-4));
+}
+
+/* One wild-but-finite reading must not leave the integrator somewhere it can
+ * never come back from. */
+static void test_survives_an_implausible_reading(void)
+{
+    axxpid_t pid;
+    int i;
+
+    (void)axxpid_init(&pid, 8, 2, AXXPID_C(0.5), 0, 100);
+    (void)axxpid_update(&pid, 50, 49, AXXPID_C(0.01));
+
+    /* A 32-bit garbage ADC word. It is finite, so it passes the NaN guard. */
+    (void)axxpid_update(&pid, 50, AXXPID_C(4294967295.0), AXXPID_C(0.01));
+    CHECK_MSG(axxpid_get_integral(&pid) < 100000,
+              "one bad reading put the integral at %.4g",
+              (double)axxpid_get_integral(&pid));
+
+    /* With the measurement above setpoint the output must reach zero, and in
+     * a sane time rather than after hours of unwinding. */
+    for (i = 0; i < 10000; ++i) {
+        (void)axxpid_update(&pid, 50, 60, AXXPID_C(0.01));
+    }
+    CHECK_MSG(axxpid_get_output(&pid) < 1,
+              "still driving %.2f a hundred seconds after a bad reading",
+              (double)axxpid_get_output(&pid));
+}
+
+/* The mirror of the latching test, against the lower limit. Both halves of
+ * the anti-windup condition need their own case: one of them can be broken
+ * while the other still passes. */
+static void test_conditional_integration_releases_at_the_lower_limit(void)
+{
+    axxpid_t pid;
+    int i;
+
+    (void)axxpid_init(&pid, 0, 5, 0, 0, 100);
+    (void)axxpid_set_integral_limits(&pid, -200, 200);
+    CHECK(axxpid_set_integral(&pid, -150) == AXXPID_OK);
+
+    (void)axxpid_update(&pid, 0, 10, AXXPID_C(0.1));
+    CHECK_NEAR(axxpid_get_output(&pid), 0, AXXPID_C(1e-4));
+    CHECK_MSG(axxpid_is_saturated(&pid), "setup is not saturated");
+
+    /* Error now positive, output still pinned at the bottom. The step raises
+     * the integral towards the usable range, so it must be taken. */
+    for (i = 0; i < 40; ++i) {
+        const axxpid_real_t previous = axxpid_get_integral(&pid);
+
+        (void)axxpid_update(&pid, 2, 0, AXXPID_C(0.1));
+        CHECK_MSG(axxpid_get_integral(&pid) > previous,
+                  "integrator latched at %.2f against the lower limit",
+                  (double)axxpid_get_integral(&pid));
+        if (i < 8) {
+            CHECK_NEAR(axxpid_get_output(&pid), 0, AXXPID_C(1e-4));
+        }
+    }
+    CHECK_NEAR(axxpid_get_integral(&pid), -110, AXXPID_C(0.5));
+}
+
+/* The manual output is stored as the caller gave it, so narrowing and then
+ * widening the output limits restores the original rather than the clipped
+ * copy. */
+static void test_manual_output_survives_a_limit_change(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 1, 0, 0, 0, 100);
+    (void)axxpid_set_mode(&pid, AXXPID_MODE_MANUAL);
+    (void)axxpid_set_manual_output(&pid, 150);
+
+    CHECK(axxpid_set_output_limits(&pid, 0, 50) == AXXPID_OK);
+    CHECK_NEAR(axxpid_update(&pid, 10, 0, AXXPID_C(0.1)), 50, AXXPID_C(1e-5));
+
+    CHECK(axxpid_set_output_limits(&pid, 0, 200) == AXXPID_OK);
+    CHECK_MSG(axxpid_test_near(axxpid_update(&pid, 10, 0, AXXPID_C(0.1)), 150,
+                               AXXPID_C(1e-4)),
+              "manual output came back as %.1f, not the 150 that was set",
+              (double)axxpid_get_output(&pid));
+}
+
+/* No single sample may throw the integral a long way, however implausible the
+ * measurement. This exercises the ordinary integral path, not the transfer
+ * preload. */
+static void test_one_bad_sample_cannot_move_the_integral_far(void)
+{
+    axxpid_t pid;
+    axxpid_real_t before;
+    axxpid_real_t after;
+
+    (void)axxpid_init(&pid, 0, 50, 0, 0, 100);
+    (void)axxpid_set_integral_limits(&pid, -AXXPID_UNLIMITED,
+                                     AXXPID_UNLIMITED);
+    /* Anti-windup off and limits removed, so the per-sample bound is the only
+     * thing standing between one bad reading and the integrator. */
+    (void)axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_NONE, 1);
+    (void)axxpid_update(&pid, 50, 49, AXXPID_C(0.01));
+    before = axxpid_get_integral(&pid);
+
+    /* A 32-bit garbage ADC word. ki*error*dt would be about -2.1e9. */
+    (void)axxpid_update(&pid, 50, AXXPID_C(4294967295.0), AXXPID_C(0.01));
+    after = axxpid_get_integral(&pid);
+
+    /* The output range is 100 wide, so one sample may move the integral by at
+     * most 1000. */
+    CHECK_MSG(((before - after) < 1001) && ((before - after) > 0),
+              "one bad sample moved the integral by %.4g",
+              (double)(before - after));
+}
+
+/* Zero is not necessarily an output this actuator can produce. */
+static void test_initial_output_is_inside_the_range(void)
+{
+    axxpid_t pid;
+
+    (void)axxpid_init(&pid, 1, 0, 0, 20, 80);
+    CHECK_NEAR(axxpid_get_output(&pid), 20, AXXPID_C(1e-5));
+
+    /* With a slew rate the starting point is visible in the first output: a
+     * controller that starts from zero ramps up through values the caller was
+     * promised would never appear. */
+    (void)axxpid_set_output_slew_rate(&pid, 10);
+    CHECK_MSG(axxpid_update(&pid, 100, 0, AXXPID_C(0.01)) >= 20,
+              "first output was %.3f, below the configured minimum of 20",
+              (double)axxpid_get_output(&pid));
+
+    /* Same after a reset, and for a range entirely below zero. */
+    (void)axxpid_reset(&pid);
+    CHECK_NEAR(axxpid_get_output(&pid), 20, AXXPID_C(1e-5));
+
+    (void)axxpid_init(&pid, 1, 0, 0, -100, -10);
+    CHECK_NEAR(axxpid_get_output(&pid), -10, AXXPID_C(1e-5));
+}
+
+static axxpid_real_t broken_ff(axxpid_real_t setpoint,
+                               axxpid_real_t measurement,
+                               void *user)
+{
+    volatile axxpid_real_t zero = 0;
+
+    (void)setpoint;
+    (void)measurement;
+    (void)user;
+    return AXXPID_C(1) / zero; /* a divide gone wrong in a lookup table */
+}
+
+/* The feed-forward hook is user code summed straight into the output and the
+ * integrator, so a bad return value is exactly as damaging as a bad sensor
+ * reading and has to be treated the same way. */
+static void test_broken_feedforward_hook_is_rejected(void)
+{
+    axxpid_t pid;
+    axxpid_real_t good;
+    int i;
+
+    (void)axxpid_init(&pid, 1, 1, 0, 0, 100);
+    good = axxpid_update(&pid, 50, 40, AXXPID_C(0.1));
+
+    (void)axxpid_set_feedforward_fn(&pid, broken_ff, NULL);
+    CHECK_MSG(axxpid_update(&pid, 50, 40, AXXPID_C(0.1)) == good,
+              "a broken feed-forward hook changed the output");
+    CHECK(axxpid_get_integral(&pid) == axxpid_get_integral(&pid));
+
+    /* And the controller recovers once the hook is removed. */
+    (void)axxpid_set_feedforward_fn(&pid, NULL, NULL);
+    for (i = 0; i < 5; ++i) {
+        const axxpid_real_t u = axxpid_update(&pid, 50, 40, AXXPID_C(0.1));
+
+        CHECK_MSG(u == u, "output is NaN after the hook was removed");
+    }
+    CHECK(axxpid_get_output(&pid) > 0);
+}
+
 static const axxpid_test_case_t tests[] = {
     {"proportional term", test_proportional},
     {"setpoint weight b", test_setpoint_weight_b},
@@ -1156,6 +1630,40 @@ static const axxpid_test_case_t tests[] = {
      test_changing_derivative_weight_does_not_kick},
     {"terms carry setpoint and measurement",
      test_terms_carry_setpoint_and_measurement},
+    {"derivative filter with unequal gains",
+     test_derivative_filter_with_unequal_gains},
+    {"derivative filter with zero kp", test_derivative_filter_with_zero_kp},
+    {"bumpless retuning compensates the derivative",
+     test_bumpless_retuning_compensates_the_derivative},
+    {"transfer with the derivative active",
+     test_transfer_with_derivative_active},
+    {"manual mode captures the live output",
+     test_manual_mode_captures_the_live_output},
+    {"transfer without an intervening update",
+     test_transfer_without_an_intervening_update},
+    {"reverse acting with setpoint weight",
+     test_reverse_acting_with_setpoint_weight},
+    {"velocity feed-forward across a stall",
+     test_velocity_feedforward_across_a_stall},
+    {"saturated reports a slew limit alone",
+     test_saturated_reports_a_slew_limit_alone},
+    {"setters move the live state", test_setters_move_the_live_state},
+    {"equal integral limits pin the integral",
+     test_equal_integral_limits_pin_the_integral},
+    {"init_config rejects every bad field",
+     test_init_config_rejects_every_bad_field},
+    {"boundary values", test_boundary_values},
+    {"survives an implausible reading", test_survives_an_implausible_reading},
+    {"conditional integration releases at the lower limit",
+     test_conditional_integration_releases_at_the_lower_limit},
+    {"manual output survives a limit change",
+     test_manual_output_survives_a_limit_change},
+    {"one bad sample cannot move the integral far",
+     test_one_bad_sample_cannot_move_the_integral_far},
+    {"initial output is inside the range",
+     test_initial_output_is_inside_the_range},
+    {"broken feed-forward hook is rejected",
+     test_broken_feedforward_hook_is_rejected},
 };
 
 AXXPID_TEST_MAIN("features", tests)

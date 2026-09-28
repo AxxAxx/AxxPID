@@ -43,8 +43,14 @@ typedef struct {
     axxpid_real_t kp; /**< Proportional gain. */
     axxpid_real_t ki; /**< Integral gain, = kp/ti. */
     axxpid_real_t kd; /**< Derivative gain, = kp*td. */
-    axxpid_real_t ti; /**< Integral time in seconds, 0 when there is no I term. */
-    axxpid_real_t td; /**< Derivative time in seconds. */
+
+    /**
+     * Integral time in seconds. Zero means "no integral action", which is
+     * also what @c ki == 0 means; the two always agree, in both directions,
+     * for any gain set this module returns.
+     */
+    axxpid_real_t ti;
+    axxpid_real_t td; /**< Derivative time in seconds. 0 means no D action. */
 } axxpid_gains_t;
 
 /**
@@ -210,14 +216,16 @@ typedef struct {
      * above the peak-to-peak measurement noise, or the relay will chatter on
      * the noise instead of on the process.
      *
-     * Keep it small. The square-root term in the @f$K_u@f$ formula is a
-     * first-harmonic correction for the shifted switching point, and it is
-     * worth well under one per cent; what hysteresis really does is move the
-     * oscillation off the ultimate frequency, and that is not corrected at
-     * all. Measured on a first-order-plus-dead-time process, an @f$h@f$ of a
-     * tenth of the resulting amplitude already biases @f$T_u@f$ by about
-     * +10%, and a fifth by about +20%, with @f$K_u@f$ drifting low to match.
-     * Treat it as the price of measuring through noise, not as a free knob.
+     * Keep it small, and understand what the correction does and does not
+     * do. The square-root term in the @f$K_u@f$ formula adjusts for the
+     * shifted switching point: it is worth @f$1/\sqrt{1-(h/a)^2}@f$, so
+     * about 0.5% at @f$h/a = 0.1@f$ and 2% at 0.2. What it does *not* correct
+     * is the larger effect - hysteresis moves the oscillation off the
+     * ultimate frequency altogether. Measured on a first-order-plus-dead-time
+     * process, @f$h@f$ at a tenth of the amplitude biases @f$T_u@f$ by about
+     * +10% and a fifth by about +20%, with @f$K_u@f$ drifting low to match.
+     * Treat hysteresis as the price of measuring through noise, not as a free
+     * knob.
      *
      * The autotune fails outright if the oscillation it provokes is less than
      * twice @f$h@f$, because below that the estimate means nothing.
@@ -286,8 +294,18 @@ typedef struct {
     bool relay_high;  /**< Current relay position. */
     bool have_period; /**< A full-period measurement window is open. */
 
-    axxpid_real_t elapsed;      /**< Total time since the start, seconds. */
-    axxpid_real_t period_start; /**< Time the open window started. */
+    /**
+     * Elapsed time, split into whole seconds and a fraction below one.
+     *
+     * A single accumulator cannot do this job in float. At 100 kHz, `elapsed
+     * += dt` stops advancing once elapsed reaches 256 s, because 1e-5 is
+     * below half of that number's last bit - so the timeout never arrives and
+     * the autotune runs forever. Keeping every addition near 1.0 avoids it.
+     */
+    uint32_t elapsed_seconds;
+    axxpid_real_t elapsed_fraction;
+
+    axxpid_real_t period_time;  /**< Time inside the open window, seconds. */
     uint16_t period_samples;    /**< Samples taken inside the open window. */
     axxpid_real_t period_max;   /**< Highest signal seen in the open window. */
     axxpid_real_t period_min;   /**< Lowest signal seen in the open window. */
@@ -341,7 +359,13 @@ axxpid_status_t axxpid_relay_init(axxpid_relay_t *relay,
  * @param relay       Autotuner. Must not be NULL.
  * @param measurement Current process value.
  * @param dt          Elapsed time since the previous call, in seconds, > 0.
- * @param output      Receives the relay output. May be NULL.
+ * @param output      Receives the value to drive the actuator with. May be
+ *                    NULL. Once the autotune has finished - however it
+ *                    finished - this is ::axxpid_relay_config_t::output_bias,
+ *                    so a caller that keeps driving the actuator from it
+ *                    parks the process at its nominal output. On a rejected
+ *                    sample, a @p dt of zero or less or a measurement that is
+ *                    not finite, the relay holds its current output.
  * @return The current autotuner state.
  */
 axxpid_relay_state_t axxpid_relay_update(axxpid_relay_t *relay,

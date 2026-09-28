@@ -710,6 +710,128 @@ static void test_gain_set_rejections(void)
     CHECK(axxpid_get_kp(&pid) == 0);
 }
 
+/* The hysteresis correction is a specific formula, not a vague direction.
+ * Drive the relay with a triangle of known amplitude so the answer can be
+ * predicted from theory rather than pinned to a previous run. */
+static void test_relay_hysteresis_correction_matches_theory(void)
+{
+    const axxpid_real_t amplitude = 10;
+    const axxpid_real_t hysteresis = 3;
+    const axxpid_real_t step = 20;
+    const long half = 500L; /* samples per half period */
+    axxpid_relay_t relay;
+    axxpid_relay_config_t cfg;
+    axxpid_relay_state_t state = AXXPID_RELAY_RUNNING;
+    axxpid_real_t u = 0;
+    axxpid_real_t ku = 0;
+    axxpid_real_t tu = 0;
+    axxpid_real_t ratio;
+    axxpid_real_t expected;
+    long i;
+
+    (void)axxpid_relay_config_default(&cfg);
+    cfg.setpoint = 0;
+    cfg.output_bias = 0;
+    cfg.output_step = step;
+    cfg.hysteresis = hysteresis;
+    cfg.cycles = 2u;
+    cfg.settle_cycles = 1u;
+    cfg.timeout = 10000;
+    (void)axxpid_relay_init(&relay, &cfg);
+
+    /* A triangle wave of amplitude 10 about the setpoint, independent of the
+     * relay, so the measured half-amplitude a is exactly 10. */
+    for (i = 0; (i < 200000L) && (state == AXXPID_RELAY_RUNNING); ++i) {
+        const long phase = i % (2L * half);
+        const axxpid_real_t ramp =
+            (phase < half) ? ((axxpid_real_t)phase / (axxpid_real_t)half)
+                           : ((axxpid_real_t)((2L * half) - phase) /
+                              (axxpid_real_t)half);
+        const axxpid_real_t pv = -amplitude + (2 * amplitude * ramp);
+
+        state = axxpid_relay_update(&relay, pv, AXXPID_C(0.001), &u);
+    }
+
+    CHECK(state == AXXPID_RELAY_DONE);
+    CHECK(axxpid_relay_result(&relay, &ku, &tu) == AXXPID_OK);
+
+    /* Ku = 4d / (pi * a * sqrt(1 - (h/a)^2)). With d=20, a=10, h=3 that is
+     * 80 / (pi * 10 * 0.95394) = 2.6698. Dropping the sqrt term entirely
+     * would give 2.5465, a 4.6% difference this tolerance can see. */
+    ratio = hysteresis / amplitude;
+    expected = (AXXPID_C(4) * step) /
+               (AXXPID_C(3.14159265358979323846) * amplitude *
+                AXXPID_C(0.953939));
+    /* 0.2%: tight enough that a square root cut short - two Newton steps
+     * instead of ten leaves about 0.5% error here - shows up as a failure. */
+    CHECK_MSG(axxpid_test_near(ku, expected, expected * AXXPID_C(0.002)),
+              "Ku %.4f, theory says %.4f (h/a = %.2f)", (double)ku,
+              (double)expected, (double)ratio);
+
+    /* One period is two half periods of 500 samples at 1 ms. */
+    CHECK_NEAR(tu, 1, AXXPID_C(0.02));
+}
+
+/* A fast loop must still be able to reach its timeout. A single float
+ * accumulator stops advancing long before 600 s at a 10 us period. */
+static void test_relay_timeout_on_a_fast_loop(void)
+{
+    axxpid_relay_t relay;
+    axxpid_relay_config_t cfg;
+    axxpid_relay_state_t state = AXXPID_RELAY_RUNNING;
+    axxpid_real_t u = 0;
+    long i;
+
+    (void)axxpid_relay_config_default(&cfg);
+    cfg.setpoint = 0;
+    cfg.output_bias = 0;
+    cfg.output_step = 10;
+    cfg.timeout = 600;
+    (void)axxpid_relay_init(&relay, &cfg);
+
+    /* A process that never moves, sampled every 10 us. 600 s is 60 million
+     * samples; allow a margin and then insist it has given up. */
+    for (i = 0; (i < 70000000L) && (state == AXXPID_RELAY_RUNNING); ++i) {
+        state = axxpid_relay_update(&relay, 0, AXXPID_C(0.00001), &u);
+    }
+
+    CHECK_MSG(state == AXXPID_RELAY_TIMEOUT,
+              "state %d after %ld samples - the clock stopped advancing",
+              (int)state, i);
+}
+
+/* Rules must reject infinities, not just zero and negatives. */
+static void test_rules_reject_non_finite_arguments(void)
+{
+    volatile axxpid_real_t zero = 0;
+    const axxpid_real_t inf_value = AXXPID_C(1) / zero;
+    const axxpid_real_t nan_value = zero / zero;
+
+    CHECK(axxpid_tune_from_ultimate(AXXPID_RULE_ZN_PID, inf_value, 4).kp == 0);
+    CHECK(axxpid_tune_from_ultimate(AXXPID_RULE_ZN_PID, 10, inf_value).kp == 0);
+    CHECK(axxpid_tune_from_ultimate(AXXPID_RULE_ZN_PID, nan_value, 4).kp == 0);
+
+    CHECK(axxpid_tune_ziegler_nichols_open(inf_value, 1, 10).kp == 0);
+    CHECK(axxpid_tune_cohen_coon(1, inf_value, 10).kp == 0);
+    CHECK(axxpid_tune_cohen_coon(nan_value, 1, 10).kp == 0);
+    CHECK(axxpid_tune_lambda(1, nan_value, 10, 5).kp == 0);
+    CHECK(axxpid_tune_lambda(1, -1, 10, 5).kp == 0);
+
+    CHECK(axxpid_gains_from_standard(nan_value, 1, 1).kp == 0);
+    CHECK(axxpid_gains_from_standard(inf_value, 1, 1).kp == 0);
+    CHECK(axxpid_gains_from_parallel(nan_value, 1, 1).kp == 0);
+
+    /* Finite inputs whose intermediate terms would overflow must not produce
+     * gains that merely look valid: either rejected outright, or finite. */
+    {
+        const axxpid_gains_t g =
+            axxpid_tune_cohen_coon(AXXPID_C(1e-30), AXXPID_C(1e-30), 1);
+
+        CHECK_MSG((g.kp == g.kp) && ((g.kp * AXXPID_C(0)) == 0),
+                  "Cohen-Coon returned a non-finite kp");
+    }
+}
+
 static const axxpid_test_case_t tests[] = {
     {"standard / parallel conversions", test_gain_conversions},
     {"applying a gain set", test_apply_gains},
@@ -726,6 +848,11 @@ static const axxpid_test_case_t tests[] = {
     {"relay fails on a marginal oscillation",
      test_relay_fails_on_a_marginal_oscillation},
     {"relay is inert after finishing", test_relay_is_inert_after_finishing},
+    {"relay hysteresis correction matches theory",
+     test_relay_hysteresis_correction_matches_theory},
+    {"relay times out on a fast loop", test_relay_timeout_on_a_fast_loop},
+    {"rules reject non-finite arguments",
+     test_rules_reject_non_finite_arguments},
     {"gain set rejections", test_gain_set_rejections},
     {"autotune produces a working controller",
      test_autotune_produces_a_working_controller},

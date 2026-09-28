@@ -231,6 +231,10 @@ typedef struct {
      * Slew rate: the maximum the output may change per second, in output
      * units. Set to 0 to disable. Applied after the output clamp.
      *
+     * Automatic mode only. In manual mode the output is whatever you set with
+     * ::axxpid_set_manual_output, because there the actuator is yours to
+     * command directly.
+     *
      * Both anti-windup strategies account for it: a rate limit holds the
      * output away from what the control law asked for just as firmly as a
      * hard limit does, so the integrator is held back in conditional mode and
@@ -240,8 +244,17 @@ typedef struct {
 
     /* --- Integrator ------------------------------------------------------- */
 
-    axxpid_real_t integral_min; /**< Lower clamp on the integral term. */
-    axxpid_real_t integral_max; /**< Upper clamp on the integral term. */
+    /**
+     * Clamps on the integral term.
+     *
+     * Leave them at +/-::AXXPID_UNLIMITED and ::axxpid_init_config derives
+     * them from the output range instead - a hundred output spans either
+     * side, which is far wider than any real controller needs but keeps the
+     * stored value somewhere float arithmetic still works. An explicit
+     * choice, however wide, is always respected.
+     */
+    axxpid_real_t integral_min;
+    axxpid_real_t integral_max;
 
     axxpid_antiwindup_t antiwindup; /**< Default ::AXXPID_ANTIWINDUP_CONDITIONAL. */
 
@@ -374,6 +387,11 @@ typedef struct {
      * current setpoint and measurement. Use it for a gain-scheduled term, a
      * lookup table, a measured-disturbance term, or a plant inverse.
      * Default NULL.
+     *
+     * If it returns a value that is not finite, the whole sample is rejected
+     * exactly as a bad sensor reading would be: the previous output is held
+     * and no state changes. A divide in a lookup table is an easy way to
+     * produce one.
      */
     axxpid_ff_fn_t ff_fn;
 
@@ -462,6 +480,7 @@ typedef struct {
 
     /* Housekeeping. */
     bool first_update;     /**< True until the first update after a reset. */
+    bool history_stale;    /**< Derivative history cannot be differenced. */
     bool bumpless_pending; /**< Preload the integrator on the next update. */
     bool has_time;         /**< ::axxpid_update_at has seen a timestamp. */
     uint32_t last_time_ms; /**< Timestamp of the last ::axxpid_update_at run. */
@@ -720,6 +739,9 @@ axxpid_status_t axxpid_set_output_slew_rate(axxpid_t *pid, axxpid_real_t rate);
  * works out the integral for you and accounts for the P, D and feed-forward
  * terms.
  *
+ * Cancels a pending bumpless transfer, so the value you set is the value the
+ * next update uses.
+ *
  * @param pid   Controller. Must not be NULL.
  * @param value New integral term, clamped to the configured integral limits.
  * @return ::AXXPID_OK, ::AXXPID_ERR_NULL, or ::AXXPID_ERR_PARAM if @p value
@@ -731,8 +753,19 @@ axxpid_status_t axxpid_set_integral(axxpid_t *pid, axxpid_real_t value);
  * @brief Clamp the integral term to an explicit range.
  *
  * Independent of the output limits, and the most direct way to cap how much
- * authority the integrator can ever accumulate. AxxSolder runs its heater at
- * +/- 300 out of a 0..500 output range.
+ * the integrator can ever contribute. AxxSolder runs its heater at +/- 300
+ * out of a 0..500 output range.
+ *
+ * Worth setting. If you do not, ::axxpid_init picks limits a hundred output
+ * spans either side of the output range - wide enough never to interfere,
+ * but not unbounded. Unbounded is dangerous: one wild sensor reading can push
+ * the integral so far that an ordinary step is smaller than its last
+ * floating-point bit and rounds away to nothing, and the loop then sits at a
+ * limit for good.
+ *
+ * Separately, and whatever you set here, no single update may change the
+ * integral by more than the full output range. A step that large is never
+ * useful control.
  *
  * @param pid Controller. Must not be NULL.
  * @param min Lower limit.

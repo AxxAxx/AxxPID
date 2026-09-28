@@ -80,15 +80,15 @@ things you end up writing yourself anyway:
 | **Introspection** | Read the P, I and D contributions separately — the single most useful thing you can do while tuning. |
 | **Asymmetric integral** | Because a heater can heat but cannot cool, and a symmetric integrator will always overshoot on a one-way actuator. |
 | **Autotuner included** | Relay feedback, plus the Ziegler–Nichols, Cohen–Coon, Tyreus–Luyben and lambda/SIMC tables. |
-| **Actually tested** | 538 assertions across four suites, including closed-loop simulations that check settling time and overshoot, not just arithmetic. |
+| **Actually tested** | 808 assertions across four suites, plus mutation testing: deliberately broken copies of the library are checked to confirm the tests catch them. |
 
 Measured with `arm-none-eabi-gcc 13.3 -Os`, **192 bytes of RAM** per controller
 instance and no heap at all:
 
 | Target | Controller | + tuning module |
 |---|---|---|
-| Cortex-M4F (hard float) | 3.9 kB | 1.8 kB |
-| Cortex-M0+ (soft float) | 4.1 kB | 2.1 kB |
+| Cortex-M4F (hard float) | 4.4 kB | 2.3 kB |
+| Cortex-M0+ (soft float) | 4.7 kB | 2.7 kB |
 
 ---
 
@@ -882,6 +882,12 @@ Every field of `axxpid_config_t`, with its default.
   integral is large, a `ki·e·dt` smaller than its last bit rounds away and
   leaves a small permanent offset. On a slow loop with small gains, build with
   `AXXPID_USE_DOUBLE=1`.
+- **A wildly wrong sensor reading still costs you a transient.** NaN and
+  infinity are rejected outright, and no single sample can move the integral
+  by more than ten times the output range, so one bad reading can no longer
+  leave the controller stuck for good. It can still leave the integral far
+  enough out to take tens of seconds to unwind. Range-check your sensor; the
+  controller cannot know what "plausible" means for your process.
 - **There is no lower bound on `dt`.** `axxpid_update_at` cannot go below 1 ms,
   but a direct `axxpid_update` call with a microsecond `dt` will amplify the
   derivative accordingly. Pass the real elapsed time.
@@ -912,13 +918,17 @@ Four suites:
 | `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, the AxxSolder profile. |
 | `test_tune` | Rule tables against the published coefficients; the relay autotuner against a plant whose true `Ku` and `Tu` are computed numerically in the test. |
 
-538 assertions in total, in both `float` and `double`. The expected values
-are derived from the difference equations above or from the published tuning
+808 assertions in total, in both `float` and `double`. Expected values are
+derived from the difference equations above or from the published tuning
 tables, not recorded from a previous run, so they catch a change in behaviour
-rather than merely pinning it. Tolerances are set just wide enough to cover
-the error that is genuinely inherent — the relay autotuner's `Ku` is checked
-against the ~18% low that the describing-function approximation actually costs
-on the test plant, not against a 30% band that would notice nothing.
+rather than merely pinning it.
+
+They are also checked by mutation testing: twenty deliberately broken copies
+of the library — an inverted filter constant, a dropped anti-windup condition,
+a missing sign — are built and run against the suite. Nineteen are caught. The
+one that is not changes a square root by 0.04%, which is far below anything
+that matters here. A test suite that no broken version can fail is not a test
+suite, and counting assertions does not tell you which you have.
 
 CI builds with GCC and Clang on Linux, macOS and Windows, in both `float` and
 `double`, against C99, C11 and C17, from C++, and cross-compiles for Cortex-M4F
