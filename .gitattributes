@@ -1,0 +1,18 @@
+# Normalise to LF in the repository regardless of each contributor's
+# core.autocrlf setting. The CI builds on Linux and macOS, and a stray CRLF in
+# a shell script or a heredoc breaks them in ways that are tedious to find.
+* text=auto eol=lf
+
+# Sources, headers and build files: always LF.
+*.c     text eol=lf
+*.h     text eol=lf
+*.ino   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.properties text eol=lf
+.clang-format text eol=lf
+.gitignore    text eol=lf
+LICENSE       text eol=lf
+Doxyfile      text eol=lf

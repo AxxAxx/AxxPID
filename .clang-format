@@ -1,0 +1,22 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 80
+UseTab: Never
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterStruct: false
+  AfterEnum: false
+  AfterControlStatement: false
+  BeforeElse: false
+IndentCaseLabels: true
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: true
+IncludeBlocks: Preserve

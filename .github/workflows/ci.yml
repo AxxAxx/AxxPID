@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.cc }} / ${{ matrix.precision }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        cc: [default]
+        precision: [float]
+        include:
+          - os: ubuntu-latest
+            cc: clang
+            precision: float
+          - os: ubuntu-latest
+            cc: default
+            precision: double
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "${{ matrix.cc }}" = "clang" ]; then export CC=clang; fi
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAXXPID_STRICT=ON \
+            -DAXXPID_USE_DOUBLE=${{ matrix.precision == 'double' && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  cross-compile:
+    name: arm-none-eabi (Cortex-M4F)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+
+      # The library must build for a real embedded target with no libc
+      # startup, no libm and no heap.
+      - name: Compile for Cortex-M4F
+        run: |
+          arm-none-eabi-gcc -c src/axxpid.c src/axxpid_tune.c \
+            -Iinclude \
+            -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
+            -std=c99 -Os -ffreestanding \
+            -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
+            -Wdouble-promotion -Wstrict-prototypes -Wmissing-prototypes \
+            -Werror
+
+      - name: Report code size
+        run: |
+          arm-none-eabi-size -t axxpid.o axxpid_tune.o
+
+  cross-compile-m0:
+    name: arm-none-eabi (Cortex-M0+, no FPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+      - name: Compile for Cortex-M0+
+        run: |
+          arm-none-eabi-gcc -c src/axxpid.c src/axxpid_tune.c \
+            -Iinclude -mcpu=cortex-m0plus -mthumb \
+            -std=c99 -Os -ffreestanding \
+            -Wall -Wextra -Wpedantic -Werror
+      - run: arm-none-eabi-size -t axxpid.o axxpid_tune.o
+
+  c-standards:
+    name: C99 / C11 / C17
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile against each standard
+        run: |
+          for std in c99 c11 c17; do
+            echo "=== $std ==="
+            gcc -c src/axxpid.c src/axxpid_tune.c -Iinclude \
+              -std=$std -Wall -Wextra -Wpedantic -Werror -o /dev/null
+          done
+
+  cpp-compatibility:
+    name: Usable from C++
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Include the headers from a C++ translation unit
+        run: |
+          cat > cpp_check.cpp <<'CPP'
+          #include "axxpid/axxpid.h"
+          #include "axxpid/axxpid_tune.h"
+          int main() {
+              axxpid_t pid;
+              axxpid_init(&pid, 1.0f, 1.0f, 0.0f);
+              axxpid_set_output_limits(&pid, 0.0f, 100.0f);
+              return axxpid_update(&pid, 10.0f, 0.0f, 0.1f) > 0.0f ? 0 : 1;
+          }
+          CPP
+          g++ cpp_check.cpp src/axxpid.c src/axxpid_tune.c -Iinclude \
+            -x none -Wall -Wextra -Werror -o cpp_check
+          ./cpp_check

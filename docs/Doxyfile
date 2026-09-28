@@ -1,0 +1,35 @@
+# Doxygen configuration for AxxPID.
+# Run:  doxygen docs/Doxyfile     Output: docs/html/index.html
+
+PROJECT_NAME           = "AxxPID"
+PROJECT_NUMBER         = 1.0.0
+PROJECT_BRIEF          = "Portable PID controller for C, with feed-forward"
+
+INPUT                  = include/axxpid src README.md
+FILE_PATTERNS          = *.h *.c *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+
+OUTPUT_DIRECTORY       = docs
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HTML_OUTPUT            = html
+
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+JAVADOC_AUTOBRIEF      = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = YES
+QUIET                  = YES
+
+# Let Doxygen see through the C++ guard and the precision switch.
+PREDEFINED             = __cplusplus= \
+                         AXXPID_USE_DOUBLE=0
