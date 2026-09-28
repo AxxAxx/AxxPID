@@ -9,32 +9,54 @@
  * dependency on any vendor HAL, performs no dynamic allocation, and uses no
  * global state: every controller lives in a caller-allocated ::axxpid_t.
  *
- * The control law is the parallel (independent-gain) PID form with
- * two-degree-of-freedom setpoint weighting and an additive feed-forward path:
- *
- * @verbatim
- *   e(t)  = sp - pv                                       (control error)
- *   P     = kp * (b*sp - pv)                              (setpoint weight b)
- *   I     = integral of ki * e(t) dt                      (output units)
- *   D     = kd * d/dt[ c*sp - pv ]  low-pass filtered     (setpoint weight c)
- *   FF    = bias + kf*sp + kf_rate*d(sp)/dt + ff_fn()
- *   u     = clamp(P + I + D + FF, out_min, out_max)
- * @endverbatim
- *
- * With the defaults (@c b = 1, @c c = 0) this is textbook "proportional on
- * error, derivative on measurement" - the form that avoids derivative kick on
- * a setpoint step.
- *
  * Quick start:
  * @code
  *   axxpid_t pid;
- *   axxpid_init(&pid, 8.0f, 2.0f, 0.5f, 0.0f, 100.0f);
+ *
+ *   //          kp    ki    kd    out_min  out_max
+ *   axxpid_init(&pid, 8.0f, 2.0f, 0.5f,    0.0f, 100.0f);
  *
  *   for (;;) {
+ *       // 0.010f is the seconds elapsed since the previous call.
  *       float u = axxpid_update(&pid, setpoint, read_sensor(), 0.010f);
  *       drive_actuator(u);
  *   }
  * @endcode
+ *
+ * Three names used throughout this file:
+ *
+ *   - **setpoint** (@c sp) - the value you want.
+ *   - **measurement** (@c pv, "process variable") - the value your sensor
+ *     reads.
+ *   - **output** (@c u) - what you send to the actuator: the heater, motor or
+ *     valve you are driving.
+ *
+ * The control law is the parallel form of PID - each gain acts on its own
+ * term - with setpoint weighting and feed-forward added:
+ *
+ * @verbatim
+ *   error = sp - pv
+ *   P     = kp * (b*sp - pv)                          b weights the setpoint
+ *   I     = running sum of ki * error * dt            stored in output units
+ *   D     = kd * d/dt[ c*sp - pv ], low-pass filtered c weights the setpoint
+ *   FF    = bias + kf*sp + kf_rate*d(sp)/dt + ff_fn()
+ *   u     = clamp(P + I + D + FF, out_min, out_max)
+ * @endverbatim
+ *
+ * The defaults are @c b = 1 and @c c = 0, which give the usual arrangement:
+ * P acts on the error, D acts on the measurement. D on the measurement is
+ * what stops the output spiking every time you change the setpoint.
+ *
+ * Where to look:
+ *
+ *   - Getting started: ::axxpid_init, ::axxpid_update, ::axxpid_update_at
+ *   - Gains: ::axxpid_set_tunings, ::axxpid_set_tunings_standard
+ *   - Stopping the integral running away: ::axxpid_set_antiwindup,
+ *     ::axxpid_set_integral_limits
+ *   - Noisy sensor: ::axxpid_set_derivative_filter
+ *   - Getting ahead of the error: ::axxpid_set_feedforward_gains
+ *   - Hand control: ::axxpid_set_mode, ::axxpid_set_manual_output
+ *   - Logging and tuning: ::axxpid_get_terms
  */
 
 #ifndef AXXPID_H
@@ -120,8 +142,10 @@ typedef enum {
  * @brief Automatic (closed-loop) or manual (open-loop) operation.
  *
  * In manual mode ::axxpid_update returns the value set with
- * ::axxpid_set_manual_output and continuously back-calculates the integrator
- * so that switching back to automatic is bumpless.
+ * ::axxpid_set_manual_output, and keeps the integral matched to it, so
+ * switching back to automatic does not jump the output. (That is a direct
+ * assignment, not the back-calculation anti-windup below; it happens in every
+ * anti-windup mode.)
  */
 typedef enum {
     AXXPID_MODE_MANUAL = 0,
@@ -129,7 +153,13 @@ typedef enum {
 } axxpid_mode_t;
 
 /**
- * @brief How the integrator is protected while the output is saturated.
+ * @brief What to do about integrator windup.
+ *
+ * Windup: while the output is pinned at @c out_min or @c out_max - saturated
+ * - the error stays large and the integral keeps growing, even though the
+ * actuator cannot do any more about it. When the error finally reverses, all
+ * of that surplus has to be unwound before the output moves, so the process
+ * sails past the setpoint and stays there for a while.
  */
 typedef enum {
     /** No protection beyond the explicit integral limits. */
@@ -144,13 +174,16 @@ typedef enum {
     AXXPID_ANTIWINDUP_CONDITIONAL = 1,
 
     /**
-     * Back-calculation / tracking: the integrator is continuously bled
-     * towards the saturation error with time constant
-     * axxpid_config_t::tracking_time, @f$ I \mathrel{+}= (dt/T_t)(u_{sat} -
-     * u_{unsat}) @f$. Smoother on release than conditional integration, and
-     * it accounts for the feed-forward and slew-limited output because the
-     * *final* output is fed back. A good starting point is
-     * @f$ T_t = \sqrt{T_i T_d} @f$, or simply @f$ T_t = T_i = k_p/k_i @f$.
+     * Back-calculation, also called tracking. Each sample the integral is
+     * pulled a little way towards the value that would have produced the
+     * output the actuator actually got:
+     *
+     *     I += (dt / tracking_time) * (limited_output - wanted_output)
+     *
+     * Smoother coming off a limit than freezing, and it accounts for the
+     * feed-forward and the slew rate too, because the final output is what is
+     * fed back. Start with @c tracking_time equal to the integral time
+     * @f$T_i = k_p/k_i@f$, or @f$\sqrt{T_i T_d}@f$ for a full PID.
      */
     AXXPID_ANTIWINDUP_BACK_CALCULATION = 2
 } axxpid_antiwindup_t;
@@ -195,8 +228,8 @@ typedef struct {
     axxpid_real_t out_max; /**< Upper actuator limit. Default +::AXXPID_UNLIMITED. */
 
     /**
-     * Maximum rate of change of the output, in output units per second.
-     * Set to 0 to disable. Applied after the output clamp.
+     * Slew rate: the maximum the output may change per second, in output
+     * units. Set to 0 to disable. Applied after the output clamp.
      *
      * Both anti-windup strategies account for it: a rate limit holds the
      * output away from what the control law asked for just as firmly as a
@@ -222,12 +255,15 @@ typedef struct {
      * @c integral_band below the setpoint"; for a reverse-acting one the
      * error is negated first, so it means the other way round.
      *
-     * This is the AxxSolder "I min error": during a long ramp the actuator is
-     * saturated anyway and the integrator can only accumulate a wind-up it
-     * will have to pay back as overshoot, so it is parked until the process
-     * comes within striking distance of the setpoint. Deliberately one-sided,
-     * because an asymmetric actuator (a heater can heat but cannot cool) needs
-     * the negative integral it has built up while above the setpoint.
+     * This is the AxxSolder "I min error". During a long ramp the actuator is
+     * flat out anyway, so anything the integral collects there will only come
+     * back as overshoot. Holding it at zero until the error is small avoids
+     * that.
+     *
+     * Deliberately one-sided. A symmetric version would also dump the integral
+     * when the process is far *above* setpoint, which is exactly when a heater
+     * - which can heat but not cool - needs the negative integral it built
+     * up.
      *
      * Default ::AXXPID_UNLIMITED (disabled).
      */
@@ -237,10 +273,10 @@ typedef struct {
      * Extra multiplier applied to @c ki while @c error < @c
      * integral_overshoot_threshold, i.e. while the measurement has overshot.
      *
-     * Asymmetric processes need asymmetric integral authority. A soldering
-     * iron heats quickly but cools only by losing heat to the air, so once it
-     * is above the setpoint the integrator must be drained several times
-     * faster than it was filled. AxxSolder runs this at 7.0.
+     * A soldering iron heats fast but cools only as fast as it loses heat to
+     * the air. Once it is above the setpoint the integral has to drain several
+     * times faster than it filled, or the overshoot lasts. AxxSolder uses
+     * 7.0.
      *
      * Default 1.0 (symmetric, i.e. disabled).
      */
@@ -248,8 +284,9 @@ typedef struct {
 
     /**
      * Error below which @c integral_overshoot_gain takes effect. AxxSolder uses
-     * -1.0 so that a small steady-state error does not trip the fast-drain
-     * path and cause hunting. Default 0.0.
+     * -1.0, so a small leftover error does not trip the fast-drain path and
+     * set the loop hunting - slowly oscillating around the setpoint. Default
+     * 0.0.
      */
     axxpid_real_t integral_overshoot_threshold;
 
@@ -284,8 +321,11 @@ typedef struct {
     /* --- Setpoint weighting (2-DOF) --------------------------------------- */
 
     /**
-     * Proportional setpoint weight @f$b@f$: the P term acts on
-     * @f$b \cdot sp - pv@f$. @c b = 1 is proportional-on-error (default);
+     * Proportional setpoint weight @f$b@f$. The P term acts on a scaled copy
+     * of the setpoint, @f$b \cdot sp - pv@f$, which lets you soften the
+     * response to a setpoint change without touching how the loop rejects
+     * disturbances. (That independence is what "two degrees of freedom"
+     * means.) @c b = 1 is proportional-on-error (default);
      * @c b = 0 is proportional-on-measurement, which removes the proportional
      * step on a setpoint change; values in between trade tracking speed for
      * overshoot without touching disturbance rejection.
@@ -535,7 +575,9 @@ axxpid_status_t axxpid_reset(axxpid_t *pid);
  *
  * @param pid    Controller. Must not be NULL.
  * @param output Output value to resume from, clamped to the output limits.
- * @return ::AXXPID_OK or ::AXXPID_ERR_NULL.
+ * @return ::AXXPID_OK, ::AXXPID_ERR_NULL, or ::AXXPID_ERR_PARAM if @p output
+ *         is not finite - in which case the controller is still cleared, it
+ *         just does not resume from anything.
  */
 axxpid_status_t axxpid_reset_to(axxpid_t *pid, axxpid_real_t output);
 
@@ -669,10 +711,10 @@ axxpid_status_t axxpid_set_output_slew_rate(axxpid_t *pid, axxpid_real_t rate);
 /**
  * @brief Set the integral term directly, in output units.
  *
- * The blunt instrument, for the cases the rest of the API does not cover:
- * clearing just the integrator without disturbing the derivative history or
- * the last output (pass 0), restoring a value saved to flash across a power
- * cycle, or handing over between gain schedules.
+ * The low-level escape hatch, for what the rest of the API does not cover:
+ * clearing only the integral, without touching the derivative history or the
+ * last output (pass 0); restoring a value saved to flash across a power
+ * cycle; or handing over between gain schedules.
  *
  * Prefer ::axxpid_reset_to for "resume from this actuator position" - it
  * works out the integral for you and accounts for the P, D and feed-forward
@@ -707,9 +749,10 @@ axxpid_status_t axxpid_set_integral_limits(axxpid_t *pid,
  * @brief Choose the anti-windup strategy.
  * @param pid           Controller. Must not be NULL.
  * @param mode          Strategy to use.
- * @param tracking_time @f$T_t@f$ in seconds; only read when @p mode is
- *                      ::AXXPID_ANTIWINDUP_BACK_CALCULATION, where it must be
- *                      greater than zero.
+ * @param tracking_time @f$T_t@f$ in seconds. Stored whenever it is greater
+ *                      than zero, but only used - and only required to be
+ *                      valid - in ::AXXPID_ANTIWINDUP_BACK_CALCULATION mode,
+ *                      so you can set it once and switch modes later.
  * @return ::AXXPID_OK, ::AXXPID_ERR_NULL, or ::AXXPID_ERR_PARAM.
  */
 axxpid_status_t axxpid_set_antiwindup(axxpid_t *pid,
@@ -840,13 +883,15 @@ axxpid_status_t axxpid_set_acting(axxpid_t *pid, axxpid_acting_t acting);
  * ::axxpid_set_manual_output second - the other order has its value
  * overwritten by the capture.
  *
- * Switching to automatic preloads the integrator on the next update so that
- * the first closed-loop output picks up from the manual output. Three things
- * legitimately override that and will produce a step: the integral limits,
- * if the value needed falls outside them; the integral engagement band, if
- * the error is outside it; and the zero-setpoint reset, if it is enabled and
- * the setpoint is zero. Each of those exists precisely to stop the
- * integrator holding a value, and they win.
+ * Switching to automatic preloads the integral on the next update, so the
+ * first automatic output is the manual output plus one normal integral step -
+ * that step is control action, not a bump.
+ *
+ * Three settings legitimately override the preload and will produce a real
+ * step: the integral limits, if the value needed falls outside them; the
+ * integral engagement band, if the error is outside it; and the zero-setpoint
+ * reset, if it is on and the setpoint is zero. Each of those exists to stop
+ * the integral holding a value, so they take priority.
  *
  * @param pid  Controller. Must not be NULL.
  * @param mode Mode to switch to.
@@ -891,7 +936,11 @@ axxpid_status_t axxpid_set_sample_time(axxpid_t *pid,
 axxpid_status_t axxpid_set_dt_max(axxpid_t *pid, axxpid_real_t dt_max);
 
 /**
- * @brief Compensate the integrator when @c kp or @c kd change at run time.
+ * @brief Compensate the integral when @c kp or @c kd change at run time.
+ *
+ * Not applied on the first update after a reset, or after a rejected sample:
+ * there is no valid P or D history to compensate against.
+ *
  * @param pid    Controller. Must not be NULL.
  * @param enable Whether to enable bumpless retuning.
  * @return ::AXXPID_OK or ::AXXPID_ERR_NULL.
@@ -936,8 +985,8 @@ axxpid_real_t axxpid_get_ff_term(const axxpid_t *pid);
 /**
  * @brief Fetch the whole P/I/D/FF breakdown in one call.
  *
- * Handy for a tuning graph or a telemetry frame - the four terms plus the
- * feed-forward always sum to the pre-clamp output.
+ * Handy for a tuning graph or a telemetry frame: P + I + D + FF is always
+ * exactly the output the control law asked for, before clamping.
  *
  * @param pid   Controller. Must not be NULL.
  * @param terms Destination. Must not be NULL.
@@ -946,12 +995,12 @@ axxpid_real_t axxpid_get_ff_term(const axxpid_t *pid);
 axxpid_status_t axxpid_get_terms(const axxpid_t *pid, axxpid_terms_t *terms);
 
 /**
- * @brief True if the control law wanted an output the actuator could not have.
+ * @brief True if the control law asked for an output the actuator cannot give.
  *
- * Set whenever the returned output differs from the raw sum of the terms,
- * which covers both the output clamp and the slew-rate limit. A loop that
- * sits saturated for long stretches is telling you the actuator is
- * undersized, or that @c kp is far too high.
+ * Set whenever the returned output differs from P + I + D + FF, which covers
+ * both the output limits and the slew rate. A loop that sits saturated for
+ * long stretches is telling you the actuator is undersized, or @c kp is far
+ * too high.
  */
 bool axxpid_is_saturated(const axxpid_t *pid);
 

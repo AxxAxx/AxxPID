@@ -20,3 +20,9 @@ cmake-build-*/
 # Doxygen
 docs/html/
 docs/latex/
+
+# Windows reserved device names. On Windows `cc -o /dev/null` creates a real
+# file called `nul`, which git cannot read: `git add` then fails with
+# "mmap failed: Invalid argument" until it is deleted.
+nul
+NUL

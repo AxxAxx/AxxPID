@@ -7,14 +7,10 @@
  * no globals, no vendor HAL. Everything is plain arithmetic on
  * ::axxpid_real_t.
  *
- * Naming: every function in this file that is not declared in the public
- * header is `static`, which is the whole of what "private" means in C. They
- * keep the `axxpid_` prefix only so that amalgamating this file into a unity
- * build cannot collide with another translation unit's helpers - not as an
- * API claim. Note that a doubled underscore would be a poor marker here: C
- * reserves only leading underscores, but C++ reserves any identifier
- * containing `__` anywhere, and these sources are meant to survive being
- * compiled by a C++ toolchain.
+ * Naming: anything not declared in the public header is `static`, which is
+ * what "private" means in C. Static helpers still carry the `axxpid_` prefix
+ * so a unity build cannot collide with another file's helpers. No `__`
+ * marker: C++ reserves any identifier containing one.
  */
 
 #include "axxpid/axxpid.h"
@@ -240,12 +236,14 @@ axxpid_status_t axxpid_init_config(axxpid_t *pid, const axxpid_config_t *cfg)
         return AXXPID_ERR_NULL;
     }
 
-    /* Install a safe controller unconditionally. Every other entry point
-     * leaves the instance untouched when it rejects an argument, because
-     * there is prior state worth protecting; here there is none, and an
-     * uninitialised axxpid_t contains a garbage ff_fn that the next update
-     * would happily call. A caller who ignores the return value must end up
-     * with a controller that does nothing, not one running on stack litter. */
+    /* Install a safe controller first, whatever happens next.
+     *
+     * Every other entry point leaves the instance untouched when it rejects
+     * an argument, because there is prior state worth protecting. Here there
+     * is none: an uninitialised axxpid_t holds a garbage ff_fn pointer that
+     * the next update would call. A caller who ignores the return value has
+     * to end up with a controller that does nothing, not one running on
+     * uninitialised memory. */
     (void)axxpid_config_default(&pid->cfg);
     axxpid_clear_state(pid);
 
@@ -293,14 +291,19 @@ axxpid_status_t axxpid_reset_to(axxpid_t *pid, axxpid_real_t output)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
+    if (!axxpid_is_finite(output)) {
+        /* Report it rather than resuming from a value we cannot honour. The
+         * controller is left cleared, which is still a safe state. */
+        axxpid_clear_state(pid);
+        return AXXPID_ERR_PARAM;
+    }
+
     axxpid_clear_state(pid);
 
-    if (axxpid_is_finite(output)) {
-        output = axxpid_clamp(output, pid->cfg.out_min, pid->cfg.out_max);
-        pid->manual_output = output;
-        pid->output = output;
-        pid->bumpless_pending = true;
-    }
+    output = axxpid_clamp(output, pid->cfg.out_min, pid->cfg.out_max);
+    pid->manual_output = output;
+    pid->output = output;
+    pid->bumpless_pending = true;
     return AXXPID_OK;
 }
 
@@ -309,11 +312,31 @@ axxpid_status_t axxpid_reset_to(axxpid_t *pid, axxpid_real_t output)
 /* -------------------------------------------------------------------------- */
 
 /**
- * @brief The control law. Returns false when the sample was rejected.
+ * @brief One control update. Returns false if the sample was rejected.
  *
- * ::axxpid_update is a thin wrapper; ::axxpid_update_at needs to know whether
- * the sample actually ran so that it does not advance its clock past an
- * interval the integrator never saw.
+ * ::axxpid_update is a thin wrapper around this. ::axxpid_update_at needs the
+ * return value, so that it does not move its clock past an interval the
+ * integrator never saw.
+ *
+ * The steps below run in this order, and the order matters:
+ *
+ *   1. Reject a bad sample. Nothing after this may see a NaN or a bad dt.
+ *   2. Cap dt. A capped sample restarts the derivative.
+ *   3. Error = direction * (setpoint - measurement), then the deadband.
+ *   4. P, D and feed-forward. None of these need the integrator.
+ *   5. Manual mode: return the manual output, and keep the integrator equal
+ *      to that output minus P, D and feed-forward so a switch back to
+ *      automatic does not jump.
+ *   6. Bumpless preload, once, after a mode switch or axxpid_reset_to().
+ *   7. Integral step. Conditional anti-windup needs P + D + FF from step 4 to
+ *      work out where the output would land.
+ *   8. Add the integral, clamp to the output limits, apply the slew rate.
+ *   9. Save the term breakdown NOW, so that P + I + D + FF is exactly the
+ *      output before clamping.
+ *  10. Back-calculation. It needs the final output from step 8, so it has to
+ *      run after the snapshot. The integrator is therefore written twice in
+ *      one call, and the reported I term is the value from between the two.
+ *  11. Save this sample for the next one.
  */
 static bool axxpid_compute(axxpid_t *pid,
                             axxpid_real_t setpoint,
@@ -386,8 +409,11 @@ static bool axxpid_compute(axxpid_t *pid,
 
     /* --- Proportional, with setpoint weight b ----------------------------- */
 
-    /* kp * dir * (b*sp - pv), rewritten around the (deadbanded) error so the
-     * deadband applies to the proportional path as well. */
+    /* We want kp * dir * (b*sp - pv). Rewritten around the error:
+     *     dir*(b*sp - pv) = dir*(sp - pv) - dir*(1-b)*sp
+     *                     = error - dir*(1-b)*sp
+     * Using the deadbanded error here is deliberate: it means the deadband
+     * applies to the P term too, not only to the integrator. */
     p_input = error - (direction * (AXXPID_C(1) - cfg->setpoint_weight_b) *
                        setpoint);
     p_term = cfg->kp * p_input;
@@ -409,12 +435,16 @@ static bool axxpid_compute(axxpid_t *pid,
     tau = cfg->derivative_filter_tau;
     if ((tau <= 0) && (cfg->derivative_filter_n > 0) && (cfg->kp > 0) &&
         (cfg->kd > 0)) {
-        /* Tf = Td / N, with Td = kd / kp. */
+        /* Tf = Td / N, where Td = kd / kp is the derivative time. Deriving
+         * the filter constant from the gains means it follows a retune on its
+         * own. (With kd or kp at zero there is no D term to filter.) */
         tau = (cfg->kd / cfg->kp) / cfg->derivative_filter_n;
     }
     if (tau > 0) {
-        /* Backward-Euler first-order low pass; alpha is recomputed from the
-         * live dt so loop jitter cannot silently detune the corner. */
+        /* Simple first-order low-pass: y += alpha * (x - y). Alpha is the
+         * fraction of each new sample that reaches the filter, and it is
+         * recomputed from the measured dt, so an irregular loop period does
+         * not quietly move the cut-off frequency. */
         const axxpid_real_t alpha = dt / (tau + dt);
         pid->d_filtered += alpha * (d_raw - pid->d_filtered);
     } else {
@@ -458,6 +488,8 @@ static bool axxpid_compute(axxpid_t *pid,
         pid->ff_term = ff_term;
         pid->saturated = (pid->manual_output > cfg->out_max) ||
                          (pid->manual_output < cfg->out_min);
+        /* Keep the derivative history current even though it went unused,
+         * so switching back to automatic does not spike the D term. */
         pid->prev_d_input = d_input;
         pid->prev_setpoint = setpoint;
         pid->output = output;
@@ -484,32 +516,30 @@ static bool axxpid_compute(axxpid_t *pid,
 
     /* --- Integrator ------------------------------------------------------- */
 
-    /* Asymmetric integral authority: once the process has overshot, an
-     * actuator that can only push in one direction needs to unwind faster
-     * than it wound up. */
     slew_limited = (cfg->out_slew_rate > 0) &&
                    (cfg->out_slew_rate < AXXPID_UNLIMITED);
     slew_step = slew_limited ? (cfg->out_slew_rate * dt) : AXXPID_C(0);
 
+    /* Once the process has overshot - error below the threshold - integrate
+     * faster. A heater can push but not pull, so the integrator has to drain
+     * faster than it filled or the overshoot lasts. */
     ki_effective = (error < cfg->integral_overshoot_threshold)
                        ? (cfg->ki * cfg->integral_overshoot_gain)
                        : cfg->ki;
     integral_step = ki_effective * error * dt;
 
     if (cfg->antiwindup == AXXPID_ANTIWINDUP_CONDITIONAL) {
-        /* Conditional integration: refuse the step only when the output would
-         * be outside what the actuator can reach AND the step pushes it
-         * further out. A step that brings the output back towards the usable
-         * range is always allowed, so the integrator can never latch.
+        /* Skip the step only if the output is already outside what the
+         * actuator can reach AND the step would push it further out. A step
+         * that moves the output back towards the usable range is always
+         * allowed, so the integrator can never latch.
          *
-         * The test is on which bound is being exceeded, not on the sign of
-         * the output. Those two agree only when the limits straddle zero; for
-         * a valve that lives between 20% and 80% the sign tells you nothing.
+         * Note we test which bound was crossed, not the sign of the output.
+         * Those agree only when the limits straddle zero; for a valve that
+         * runs between 20% and 80% the sign tells you nothing.
          *
-         * "What the actuator can reach" includes the slew rate. A rate limit
-         * holds the output away from the control law's demand just as firmly
-         * as a hard limit does, so ignoring it here would let the integrator
-         * wind up freely through every rate-limited ramp. */
+         * "Can reach" includes the slew rate, because a rate limit holds the
+         * output back just as firmly as a hard limit. */
         axxpid_real_t reachable_min = cfg->out_min;
         axxpid_real_t reachable_max = cfg->out_max;
         axxpid_real_t candidate;
@@ -539,9 +569,12 @@ static bool axxpid_compute(axxpid_t *pid,
         pid->integral += integral_step;
     }
 
+    /* Hard cap on the integral, applied whatever the anti-windup mode. */
     pid->integral = axxpid_clamp(pid->integral, cfg->integral_min,
                                   cfg->integral_max);
 
+    /* The two overrides run last, so nothing else in this sample can put the
+     * integrator back. */
     if (cfg->integral_reset_on_zero_setpoint && (setpoint == 0)) {
         pid->integral = 0;
         integral_forced_zero = true;
@@ -604,6 +637,7 @@ static bool axxpid_compute(axxpid_t *pid,
                                       cfg->integral_max);
     }
 
+    /* Remember this sample for the next derivative and velocity feed-forward. */
     pid->prev_d_input = d_input;
     pid->prev_setpoint = setpoint;
     pid->output = output;
@@ -657,6 +691,8 @@ bool axxpid_update_at(axxpid_t *pid,
         return false;
     }
     if (elapsed_ms == 0u) {
+        /* dt would be zero, which the control law rejects anyway - and that
+         * rejection would needlessly clear the derivative history. */
         return false;
     }
 
@@ -722,12 +758,18 @@ axxpid_status_t axxpid_set_tunings_standard(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
+    if (!axxpid_is_finite(kp) || !axxpid_is_finite(ti) ||
+        !axxpid_is_finite(td)) {
+        return AXXPID_ERR_PARAM;
+    }
     if ((kp < 0) || (ti < 0) || (td < 0)) {
         return AXXPID_ERR_PARAM;
     }
 
     /* ti == 0 is the documented way to ask for no integral action; dividing
-     * by it would be undefined. */
+     * by it would be undefined. A NaN ti would also fail the `ti > 0` test
+     * and quietly turn the integrator off, which is why it is rejected
+     * above rather than left to fall through here. */
     ki = (ti > 0) ? (kp / ti) : AXXPID_C(0);
     return axxpid_set_tunings(pid, kp, ki, kp * td);
 }
@@ -918,6 +960,12 @@ axxpid_status_t axxpid_set_setpoint_weights(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
+    /* Check for NaN separately. Every comparison against NaN is false, so
+     * `b < 0 || b > 1` waves it straight through and it reaches the control
+     * law on the next update. */
+    if (!axxpid_is_finite(b) || !axxpid_is_finite(c)) {
+        return AXXPID_ERR_PARAM;
+    }
     if ((b < 0) || (b > 1) || (c < 0) || (c > 1)) {
         return AXXPID_ERR_PARAM;
     }
@@ -1022,6 +1070,8 @@ axxpid_status_t axxpid_set_mode(axxpid_t *pid, axxpid_mode_t mode)
         pid->bumpless_pending = true;
     }
     if (mode == AXXPID_MODE_MANUAL) {
+        /* Capture the live output, so manual mode starts where automatic left
+         * off. Call axxpid_set_manual_output() afterwards to override it. */
         pid->manual_output = pid->output;
     }
     pid->cfg.mode = mode;

@@ -988,6 +988,104 @@ static void test_terms_carry_setpoint_and_measurement(void)
     CHECK_NEAR(terms.error, AXXPID_C(24.5), AXXPID_C(1e-5));
 }
 
+/* A range check of the form `x < 0 || x > 1` does not reject NaN, because
+ * every comparison against NaN is false. Each setter that takes a real number
+ * must test for finiteness separately, or a bad value walks past the guard
+ * and reaches the control law on the next update. This sweeps all of them. */
+static void test_no_setter_accepts_a_non_finite_value(void)
+{
+    volatile axxpid_real_t zero = 0;
+    const axxpid_real_t nan_value = zero / zero;
+    const axxpid_real_t inf_value = AXXPID_C(1) / zero;
+    size_t i;
+
+    for (i = 0; i < 2u; ++i) {
+        const axxpid_real_t bad = (i == 0u) ? nan_value : inf_value;
+        axxpid_t pid;
+
+        (void)axxpid_init(&pid, 1, 1, 1, 0, 100);
+
+        CHECK(axxpid_set_tunings(&pid, bad, 1, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_tunings(&pid, 1, bad, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_tunings(&pid, 1, 1, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_tunings_standard(&pid, bad, 1, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_tunings_standard(&pid, 1, bad, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_tunings_standard(&pid, 1, 1, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_kp(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_ki(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_kd(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_setpoint_weights(&pid, bad, 0) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_setpoint_weights(&pid, 0, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_output_limits(&pid, 0, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_output_limits(&pid, bad, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_output_slew_rate(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral_limits(&pid, bad, 1) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral_limits(&pid, 0, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral_band(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral_overshoot(&pid, bad, 0) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_integral_overshoot(&pid, 1, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_derivative_filter(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_derivative_filter_tau(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_deadband(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_feedforward_bias(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_feedforward_gains(&pid, bad, 0) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_feedforward_gains(&pid, 0, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_manual_output(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_dt_max(&pid, bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_BACK_CALCULATION,
+                                    bad) == AXXPID_ERR_PARAM);
+        CHECK(axxpid_reset_to(&pid, bad) == AXXPID_ERR_PARAM);
+
+        /* Having rejected every one of those, the controller must still run
+         * normally rather than having quietly stored something poisonous. */
+        {
+            const axxpid_real_t u = axxpid_update(&pid, 50, 10, AXXPID_C(0.1));
+
+            CHECK_MSG(u == u, "output is NaN after rejected setters");
+            CHECK(pid.integral == pid.integral);
+            CHECK(u > 0);
+        }
+    }
+}
+
+/* The derivative weight is the subtle one: a bad value does not show up on
+ * the update that follows, because that update restarts the derivative
+ * history. It bites on the one after. */
+static void test_non_finite_weight_does_not_bite_one_sample_later(void)
+{
+    axxpid_t pid;
+    volatile axxpid_real_t zero = 0;
+    const axxpid_real_t nan_value = zero / zero;
+    int i;
+
+    (void)axxpid_init(&pid, 1, 1, 1, 0, 100);
+    CHECK(axxpid_set_setpoint_weights(&pid, 0, nan_value) == AXXPID_ERR_PARAM);
+
+    for (i = 0; i < 4; ++i) {
+        const axxpid_real_t u = axxpid_update(&pid, 50, 10, AXXPID_C(0.1));
+
+        CHECK_MSG(u == u, "output went NaN on update %d", i);
+    }
+}
+
+/* A non-finite integral time used to fail the `ti > 0` test and silently turn
+ * integral action off, which is far worse than an error return: the loop then
+ * runs with a standing offset and nothing says why. */
+static void test_non_finite_integral_time_is_reported(void)
+{
+    axxpid_t pid;
+    volatile axxpid_real_t zero = 0;
+    const axxpid_real_t nan_value = zero / zero;
+
+    (void)axxpid_init(&pid, 2, 5, 0, 0, 100);
+    CHECK(axxpid_set_tunings_standard(&pid, 1, nan_value, 0) ==
+          AXXPID_ERR_PARAM);
+
+    /* Rejected, so the original integral gain is still in place. */
+    CHECK(axxpid_get_ki(&pid) == 5);
+}
+
 static const axxpid_test_case_t tests[] = {
     {"proportional term", test_proportional},
     {"setpoint weight b", test_setpoint_weight_b},
@@ -1047,6 +1145,12 @@ static const axxpid_test_case_t tests[] = {
      test_failed_init_leaves_a_safe_controller},
     {"non-finite configuration is rejected",
      test_non_finite_config_is_rejected},
+    {"no setter accepts a non-finite value",
+     test_no_setter_accepts_a_non_finite_value},
+    {"non-finite weight does not bite one sample later",
+     test_non_finite_weight_does_not_bite_one_sample_later},
+    {"non-finite integral time is reported",
+     test_non_finite_integral_time_is_reported},
     {"setting the integral directly", test_set_integral},
     {"changing the derivative weight does not kick",
      test_changing_derivative_weight_does_not_kick},
