@@ -95,6 +95,46 @@ jobs:
               -std=$std -Wall -Wextra -Wpedantic -Werror -o /dev/null
           done
 
+  reserved-identifiers:
+    name: No identifiers reserved to the implementation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # C reserves identifiers with a leading underscore; C++ reserves any
+      # identifier containing a doubled underscore anywhere. These sources are
+      # compiled by C++ toolchains too, so neither may appear -- except for
+      # the compiler's own predefined macros, which we are meant to test.
+      - name: Scan headers and sources
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          ALLOWED = re.compile(
+              r"^__(FILE|LINE|DATE|TIME|func|VA_ARGS|cplusplus|STDC\w*|"
+              r"GNUC\w*|clang\w*|has_\w+|attribute)(__)?$")
+          IDENT = re.compile(r"_*[A-Za-z_][A-Za-z0-9_]*")
+
+          bad = []
+          for path in sorted(pathlib.Path("include").rglob("*.h")) +                       sorted(pathlib.Path("src").rglob("*.c")):
+              text = path.read_text(encoding="utf-8")
+              # Strip comments so prose about "__" does not trip the scan.
+              text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+              text = re.sub(r"//[^
+]*", " ", text)
+              for n, line in enumerate(text.splitlines(), 1):
+                  for ident in IDENT.findall(line):
+                      if ALLOWED.match(ident):
+                          continue
+                      if ident.startswith("_") or "__" in ident:
+                          bad.append("%s:%d: %s" % (path, n, ident))
+
+          if bad:
+              for b in bad:
+                  print("::error::reserved identifier -> " + b)
+              sys.exit(1)
+          print("clean: no reserved identifiers")
+          PY
+
   cpp-compatibility:
     name: Usable from C++
     runs-on: ubuntu-latest

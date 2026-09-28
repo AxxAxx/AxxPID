@@ -6,6 +6,15 @@
  * headers pulled in by axxpid.h: no <math.h>, no <stdlib.h>, no allocation,
  * no globals, no vendor HAL. Everything is plain arithmetic on
  * ::axxpid_real_t.
+ *
+ * Naming: every function in this file that is not declared in the public
+ * header is `static`, which is the whole of what "private" means in C. They
+ * keep the `axxpid_` prefix only so that amalgamating this file into a unity
+ * build cannot collide with another translation unit's helpers - not as an
+ * API claim. Note that a doubled underscore would be a poor marker here: C
+ * reserves only leading underscores, but C++ reserves any identifier
+ * containing `__` anywhere, and these sources are meant to survive being
+ * compiled by a C++ toolchain.
  */
 
 #include "axxpid/axxpid.h"
@@ -15,7 +24,7 @@
 /* -------------------------------------------------------------------------- */
 
 /** @brief Clamp @p v into [@p lo, @p hi]. */
-static axxpid_real_t axxpid__clamp(axxpid_real_t v,
+static axxpid_real_t axxpid_clamp(axxpid_real_t v,
                                    axxpid_real_t lo,
                                    axxpid_real_t hi)
 {
@@ -39,7 +48,7 @@ static axxpid_real_t axxpid__clamp(axxpid_real_t v,
  *       occur and lets it delete the @c v == v test. Do not use
  *       @c -ffast-math if you rely on this guard.
  */
-static bool axxpid__finite(axxpid_real_t v)
+static bool axxpid_is_finite(axxpid_real_t v)
 {
     return (v == v) && (v <= AXXPID_UNLIMITED) && (v >= -AXXPID_UNLIMITED);
 }
@@ -51,7 +60,7 @@ static bool axxpid__finite(axxpid_real_t v)
  * against everything: a range test of the form @c x<0 waves NaN straight
  * through, and it would then poison the integrator on the first update.
  */
-static bool axxpid__config_valid(const axxpid_config_t *cfg)
+static bool axxpid_config_is_valid(const axxpid_config_t *cfg)
 {
     const axxpid_real_t *const reals[] = {
         &cfg->kp,
@@ -79,7 +88,7 @@ static bool axxpid__config_valid(const axxpid_config_t *cfg)
     size_t i;
 
     for (i = 0; i < (sizeof(reals) / sizeof(reals[0])); ++i) {
-        if (!axxpid__finite(*reals[i])) {
+        if (!axxpid_is_finite(*reals[i])) {
             return false;
         }
     }
@@ -147,7 +156,7 @@ static bool axxpid__config_valid(const axxpid_config_t *cfg)
 }
 
 /** @brief Clear every piece of runtime state, leaving the configuration alone. */
-static void axxpid__clear_state(axxpid_t *pid)
+static void axxpid_clear_state(axxpid_t *pid)
 {
     pid->integral = 0;
     pid->d_filtered = 0;
@@ -238,9 +247,9 @@ axxpid_status_t axxpid_init_config(axxpid_t *pid, const axxpid_config_t *cfg)
      * would happily call. A caller who ignores the return value must end up
      * with a controller that does nothing, not one running on stack litter. */
     (void)axxpid_config_default(&pid->cfg);
-    axxpid__clear_state(pid);
+    axxpid_clear_state(pid);
 
-    if (!axxpid__config_valid(cfg)) {
+    if (!axxpid_config_is_valid(cfg)) {
         return AXXPID_ERR_PARAM;
     }
 
@@ -275,7 +284,7 @@ axxpid_status_t axxpid_reset(axxpid_t *pid)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    axxpid__clear_state(pid);
+    axxpid_clear_state(pid);
     return AXXPID_OK;
 }
 
@@ -284,10 +293,10 @@ axxpid_status_t axxpid_reset_to(axxpid_t *pid, axxpid_real_t output)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    axxpid__clear_state(pid);
+    axxpid_clear_state(pid);
 
-    if (axxpid__finite(output)) {
-        output = axxpid__clamp(output, pid->cfg.out_min, pid->cfg.out_max);
+    if (axxpid_is_finite(output)) {
+        output = axxpid_clamp(output, pid->cfg.out_min, pid->cfg.out_max);
         pid->manual_output = output;
         pid->output = output;
         pid->bumpless_pending = true;
@@ -306,7 +315,7 @@ axxpid_status_t axxpid_reset_to(axxpid_t *pid, axxpid_real_t output)
  * the sample actually ran so that it does not advance its clock past an
  * interval the integrator never saw.
  */
-static bool axxpid__compute(axxpid_t *pid,
+static bool axxpid_compute(axxpid_t *pid,
                             axxpid_real_t setpoint,
                             axxpid_real_t measurement,
                             axxpid_real_t dt)
@@ -340,8 +349,8 @@ static bool axxpid__compute(axxpid_t *pid,
      * mark the derivative history stale. Carrying it across the gap would
      * make the next good sample divide a two-interval change by one
      * interval, and report a derivative twice the real one. */
-    if (!axxpid__finite(setpoint) || !axxpid__finite(measurement) ||
-        !axxpid__finite(dt) || !(dt > 0)) {
+    if (!axxpid_is_finite(setpoint) || !axxpid_is_finite(measurement) ||
+        !axxpid_is_finite(dt) || !(dt > 0)) {
         pid->first_update = true;
         return false;
     }
@@ -432,11 +441,11 @@ static bool axxpid__compute(axxpid_t *pid,
     /* --- Manual mode: hold the output and track the integrator ------------ */
 
     if (cfg->mode == AXXPID_MODE_MANUAL) {
-        output = axxpid__clamp(pid->manual_output, cfg->out_min, cfg->out_max);
+        output = axxpid_clamp(pid->manual_output, cfg->out_min, cfg->out_max);
 
         /* Keep the integrator at the value that would reproduce the manual
          * output, so returning to automatic is bumpless. */
-        pid->integral = axxpid__clamp(output - feedback_free,
+        pid->integral = axxpid_clamp(output - feedback_free,
                                       cfg->integral_min, cfg->integral_max);
 
         pid->error = error;
@@ -466,9 +475,9 @@ static bool axxpid__compute(axxpid_t *pid,
          * actuator at the limit for as long as it takes the integrator to
          * unwind the difference. */
         const axxpid_real_t resume_from =
-            axxpid__clamp(pid->manual_output, cfg->out_min, cfg->out_max);
+            axxpid_clamp(pid->manual_output, cfg->out_min, cfg->out_max);
 
-        pid->integral = axxpid__clamp(resume_from - feedback_free,
+        pid->integral = axxpid_clamp(resume_from - feedback_free,
                                       cfg->integral_min, cfg->integral_max);
         pid->bumpless_pending = false;
     }
@@ -530,7 +539,7 @@ static bool axxpid__compute(axxpid_t *pid,
         pid->integral += integral_step;
     }
 
-    pid->integral = axxpid__clamp(pid->integral, cfg->integral_min,
+    pid->integral = axxpid_clamp(pid->integral, cfg->integral_min,
                                   cfg->integral_max);
 
     if (cfg->integral_reset_on_zero_setpoint && (setpoint == 0)) {
@@ -548,10 +557,10 @@ static bool axxpid__compute(axxpid_t *pid,
     /* --- Sum, clamp, slew-limit ------------------------------------------- */
 
     output_unsaturated = feedback_free + pid->integral;
-    output = axxpid__clamp(output_unsaturated, cfg->out_min, cfg->out_max);
+    output = axxpid_clamp(output_unsaturated, cfg->out_min, cfg->out_max);
 
     if (slew_limited) {
-        output = axxpid__clamp(output, pid->output - slew_step,
+        output = axxpid_clamp(output, pid->output - slew_step,
                                pid->output + slew_step);
     }
 
@@ -591,7 +600,7 @@ static bool axxpid__compute(axxpid_t *pid,
             tracking_gain = 1;
         }
         pid->integral += tracking_gain * (output - output_unsaturated);
-        pid->integral = axxpid__clamp(pid->integral, cfg->integral_min,
+        pid->integral = axxpid_clamp(pid->integral, cfg->integral_min,
                                       cfg->integral_max);
     }
 
@@ -618,7 +627,7 @@ axxpid_real_t axxpid_update(axxpid_t *pid,
      * nominal period instead of integrating the whole gap a second time. */
     pid->has_time = false;
 
-    (void)axxpid__compute(pid, setpoint, measurement, dt);
+    (void)axxpid_compute(pid, setpoint, measurement, dt);
     return pid->output;
 }
 
@@ -651,7 +660,7 @@ bool axxpid_update_at(axxpid_t *pid,
         return false;
     }
 
-    if (!axxpid__compute(pid, setpoint, measurement,
+    if (!axxpid_compute(pid, setpoint, measurement,
                          (axxpid_real_t)elapsed_ms / AXXPID_C(1000))) {
         /* The sample was rejected. Leaving the clock where it is means the
          * skipped interval is rolled into the next good sample rather than
@@ -676,8 +685,8 @@ axxpid_status_t axxpid_set_tunings(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((kp < 0) || (ki < 0) || (kd < 0) || !axxpid__finite(kp) ||
-        !axxpid__finite(ki) || !axxpid__finite(kd)) {
+    if ((kp < 0) || (ki < 0) || (kd < 0) || !axxpid_is_finite(kp) ||
+        !axxpid_is_finite(ki) || !axxpid_is_finite(kd)) {
         return AXXPID_ERR_PARAM;
     }
 
@@ -688,7 +697,7 @@ axxpid_status_t axxpid_set_tunings(axxpid_t *pid,
          * so changing ki only affects future accumulation. */
         const axxpid_real_t new_p = kp * pid->p_input;
         const axxpid_real_t new_d = kd * pid->d_filtered;
-        pid->integral = axxpid__clamp(pid->integral + pid->p_term +
+        pid->integral = axxpid_clamp(pid->integral + pid->p_term +
                                           pid->d_term - new_p - new_d,
                                       pid->cfg.integral_min,
                                       pid->cfg.integral_max);
@@ -758,7 +767,7 @@ axxpid_status_t axxpid_set_output_limits(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!(min < max) || !axxpid__finite(min) || !axxpid__finite(max)) {
+    if (!(min < max) || !axxpid_is_finite(min) || !axxpid_is_finite(max)) {
         return AXXPID_ERR_PARAM;
     }
 
@@ -766,8 +775,8 @@ axxpid_status_t axxpid_set_output_limits(axxpid_t *pid,
     pid->cfg.out_max = max;
 
     /* Bring the live state inside the new range immediately. */
-    pid->output = axxpid__clamp(pid->output, min, max);
-    pid->manual_output = axxpid__clamp(pid->manual_output, min, max);
+    pid->output = axxpid_clamp(pid->output, min, max);
+    pid->manual_output = axxpid_clamp(pid->manual_output, min, max);
     return AXXPID_OK;
 }
 
@@ -776,7 +785,7 @@ axxpid_status_t axxpid_set_output_slew_rate(axxpid_t *pid, axxpid_real_t rate)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((rate < 0) || !axxpid__finite(rate)) {
+    if ((rate < 0) || !axxpid_is_finite(rate)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.out_slew_rate = rate;
@@ -788,10 +797,10 @@ axxpid_status_t axxpid_set_integral(axxpid_t *pid, axxpid_real_t value)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!axxpid__finite(value)) {
+    if (!axxpid_is_finite(value)) {
         return AXXPID_ERR_PARAM;
     }
-    pid->integral = axxpid__clamp(value, pid->cfg.integral_min,
+    pid->integral = axxpid_clamp(value, pid->cfg.integral_min,
                                   pid->cfg.integral_max);
     return AXXPID_OK;
 }
@@ -803,13 +812,13 @@ axxpid_status_t axxpid_set_integral_limits(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((min > max) || !axxpid__finite(min) || !axxpid__finite(max)) {
+    if ((min > max) || !axxpid_is_finite(min) || !axxpid_is_finite(max)) {
         return AXXPID_ERR_PARAM;
     }
 
     pid->cfg.integral_min = min;
     pid->cfg.integral_max = max;
-    pid->integral = axxpid__clamp(pid->integral, min, max);
+    pid->integral = axxpid_clamp(pid->integral, min, max);
     return AXXPID_OK;
 }
 
@@ -825,7 +834,7 @@ axxpid_status_t axxpid_set_antiwindup(axxpid_t *pid,
         case AXXPID_ANTIWINDUP_CONDITIONAL:
             break;
         case AXXPID_ANTIWINDUP_BACK_CALCULATION:
-            if (!(tracking_time > 0) || !axxpid__finite(tracking_time)) {
+            if (!(tracking_time > 0) || !axxpid_is_finite(tracking_time)) {
                 return AXXPID_ERR_PARAM;
             }
             break;
@@ -845,7 +854,7 @@ axxpid_status_t axxpid_set_integral_band(axxpid_t *pid, axxpid_real_t band)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((band < 0) || !axxpid__finite(band)) {
+    if ((band < 0) || !axxpid_is_finite(band)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.integral_band = band;
@@ -859,7 +868,7 @@ axxpid_status_t axxpid_set_integral_overshoot(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((gain < 0) || !axxpid__finite(gain) || !axxpid__finite(threshold)) {
+    if ((gain < 0) || !axxpid_is_finite(gain) || !axxpid_is_finite(threshold)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.integral_overshoot_gain = gain;
@@ -882,7 +891,7 @@ axxpid_status_t axxpid_set_derivative_filter(axxpid_t *pid, axxpid_real_t n)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((n < 0) || !axxpid__finite(n)) {
+    if ((n < 0) || !axxpid_is_finite(n)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.derivative_filter_n = n;
@@ -895,7 +904,7 @@ axxpid_status_t axxpid_set_derivative_filter_tau(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((tau < 0) || !axxpid__finite(tau)) {
+    if ((tau < 0) || !axxpid_is_finite(tau)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.derivative_filter_tau = tau;
@@ -931,7 +940,7 @@ axxpid_status_t axxpid_set_deadband(axxpid_t *pid, axxpid_real_t deadband)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if ((deadband < 0) || !axxpid__finite(deadband)) {
+    if ((deadband < 0) || !axxpid_is_finite(deadband)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.deadband = deadband;
@@ -943,7 +952,7 @@ axxpid_status_t axxpid_set_feedforward_bias(axxpid_t *pid, axxpid_real_t bias)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!axxpid__finite(bias)) {
+    if (!axxpid_is_finite(bias)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.ff_bias = bias;
@@ -957,7 +966,7 @@ axxpid_status_t axxpid_set_feedforward_gains(axxpid_t *pid,
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!axxpid__finite(setpoint_gain) || !axxpid__finite(rate_gain)) {
+    if (!axxpid_is_finite(setpoint_gain) || !axxpid_is_finite(rate_gain)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.ff_setpoint_gain = setpoint_gain;
@@ -1024,12 +1033,12 @@ axxpid_status_t axxpid_set_manual_output(axxpid_t *pid, axxpid_real_t output)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!axxpid__finite(output)) {
+    if (!axxpid_is_finite(output)) {
         return AXXPID_ERR_PARAM;
     }
     pid->manual_output = output;
     if (pid->cfg.mode == AXXPID_MODE_MANUAL) {
-        pid->output = axxpid__clamp(output, pid->cfg.out_min, pid->cfg.out_max);
+        pid->output = axxpid_clamp(output, pid->cfg.out_min, pid->cfg.out_max);
     }
     return AXXPID_OK;
 }
@@ -1058,7 +1067,7 @@ axxpid_status_t axxpid_set_dt_max(axxpid_t *pid, axxpid_real_t dt_max)
     if (pid == (axxpid_t *)0) {
         return AXXPID_ERR_NULL;
     }
-    if (!(dt_max > 0) || !axxpid__finite(dt_max)) {
+    if (!(dt_max > 0) || !axxpid_is_finite(dt_max)) {
         return AXXPID_ERR_PARAM;
     }
     pid->cfg.dt_max = dt_max;

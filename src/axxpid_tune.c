@@ -6,6 +6,15 @@
  * <math.h>. The one transcendental it needs is a square root, provided here
  * by range reduction plus Newton-Raphson so that the library links on a
  * bare-metal target with no libm.
+ *
+ * Naming: every function in this file that is not declared in the public
+ * header is `static`, which is the whole of what "private" means in C. They
+ * keep the `axxpid_` prefix only so that amalgamating this file into a unity
+ * build cannot collide with another translation unit's helpers - not as an
+ * API claim. Note that a doubled underscore would be a poor marker here: C
+ * reserves only leading underscores, but C++ reserves any identifier
+ * containing `__` anywhere, and these sources are meant to survive being
+ * compiled by a C++ toolchain.
  */
 
 #include "axxpid/axxpid_tune.h"
@@ -20,7 +29,7 @@
  * outside the ::AXXPID_UNLIMITED sentinel range, which is finite for exactly
  * this reason.
  */
-static bool axxpid__finite(axxpid_real_t v)
+static bool axxpid_is_finite(axxpid_real_t v)
 {
     return (v == v) && (v <= AXXPID_UNLIMITED) && (v >= -AXXPID_UNLIMITED);
 }
@@ -38,7 +47,7 @@ static bool axxpid__finite(axxpid_real_t v)
  * power of two. Ten iterations are used for margin; this runs once per
  * autotune, not once per sample.
  */
-static axxpid_real_t axxpid__sqrt(axxpid_real_t v)
+static axxpid_real_t axxpid_sqrt(axxpid_real_t v)
 {
     axxpid_real_t scale = 1;
     axxpid_real_t x;
@@ -47,7 +56,7 @@ static axxpid_real_t axxpid__sqrt(axxpid_real_t v)
     /* Reject non-finite input before the range reduction. Infinity divided by
      * four is still infinity, so the loop below would never terminate - and
      * it runs inside a control loop. */
-    if (!(v > 0) || !axxpid__finite(v)) {
+    if (!(v > 0) || !axxpid_is_finite(v)) {
         return 0;
     }
     while (v >= AXXPID_C(4)) {
@@ -67,7 +76,7 @@ static axxpid_real_t axxpid__sqrt(axxpid_real_t v)
 }
 
 /** @brief Build an all-zero gain set, used for every rejected argument. */
-static axxpid_gains_t axxpid__no_gains(void)
+static axxpid_gains_t axxpid_zero_gains(void)
 {
     axxpid_gains_t g;
     g.kp = 0;
@@ -89,7 +98,7 @@ axxpid_gains_t axxpid_gains_from_standard(axxpid_real_t kp,
     axxpid_gains_t g;
 
     if ((kp < 0) || (ti < 0) || (td < 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
     g.kp = kp;
     g.ti = ti;
@@ -106,7 +115,7 @@ axxpid_gains_t axxpid_gains_from_parallel(axxpid_real_t kp,
     axxpid_gains_t g;
 
     if ((kp < 0) || (ki < 0) || (kd < 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
     g.kp = kp;
     g.ki = ki;
@@ -133,7 +142,7 @@ axxpid_gains_t axxpid_tune_from_ultimate(axxpid_rule_t rule,
                                          axxpid_real_t tu)
 {
     if (!(ku > 0) || !(tu > 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
 
     switch (rule) {
@@ -174,7 +183,7 @@ axxpid_gains_t axxpid_tune_from_ultimate(axxpid_rule_t rule,
                                               tu / AXXPID_C(6.3));
 
         default:
-            return axxpid__no_gains();
+            return axxpid_zero_gains();
     }
 }
 
@@ -187,7 +196,7 @@ axxpid_gains_t axxpid_tune_ziegler_nichols_open(axxpid_real_t k,
                                                 axxpid_real_t t)
 {
     if (!(k > 0) || !(l > 0) || !(t > 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
     /* kp = 1.2 T / (K L), Ti = 2L, Td = 0.5L. */
     return axxpid_gains_from_standard((AXXPID_C(1.2) * t) / (k * l),
@@ -204,7 +213,7 @@ axxpid_gains_t axxpid_tune_cohen_coon(axxpid_real_t k,
     axxpid_real_t td;
 
     if (!(k > 0) || !(l > 0) || !(t > 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
 
     r = l / t;
@@ -226,7 +235,7 @@ axxpid_gains_t axxpid_tune_lambda(axxpid_real_t k,
     axxpid_real_t four_sum;
 
     if (!(k > 0) || (l < 0) || !(t > 0) || !(lambda > 0)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
 
     kp = t / (k * (lambda + l));
@@ -302,7 +311,7 @@ axxpid_status_t axxpid_relay_init(axxpid_relay_t *relay,
 }
 
 /** @brief Compute Ku and Tu once enough periods have been collected. */
-static void axxpid__relay_finish(axxpid_relay_t *relay)
+static void axxpid_relay_estimate(axxpid_relay_t *relay)
 {
     const axxpid_real_t h = relay->cfg.hysteresis;
     axxpid_real_t a;
@@ -321,7 +330,7 @@ static void axxpid__relay_finish(axxpid_relay_t *relay)
      * never fire. It is not a rounding concern either: as a approaches h the
      * estimate runs away as 1/sqrt(a^2-h^2), and the whole first-harmonic
      * approximation has stopped meaning anything well before that. */
-    if (!axxpid__finite(a) || !(a > 0) || !(a >= (AXXPID_C(2) * h))) {
+    if (!axxpid_is_finite(a) || !(a > 0) || !(a >= (AXXPID_C(2) * h))) {
         relay->state = AXXPID_RELAY_FAILED;
         return;
     }
@@ -332,7 +341,7 @@ static void axxpid__relay_finish(axxpid_relay_t *relay)
     {
         const axxpid_real_t ratio = h / a;
 
-        denom = AXXPID_PI * a * axxpid__sqrt(AXXPID_C(1) - (ratio * ratio));
+        denom = AXXPID_PI * a * axxpid_sqrt(AXXPID_C(1) - (ratio * ratio));
     }
     if (!(denom > 0)) {
         relay->state = AXXPID_RELAY_FAILED;
@@ -362,7 +371,7 @@ axxpid_relay_state_t axxpid_relay_update(axxpid_relay_t *relay,
         }
         return relay->state;
     }
-    if (!(dt > 0) || !axxpid__finite(dt) || !axxpid__finite(measurement)) {
+    if (!(dt > 0) || !axxpid_is_finite(dt) || !axxpid_is_finite(measurement)) {
         /* Bad sample or timestep: hold the relay where it is. */
         if (output != (axxpid_real_t *)0) {
             *output = relay->output;
@@ -451,7 +460,7 @@ axxpid_relay_state_t axxpid_relay_update(axxpid_relay_t *relay,
                                        : -relay->cfg.output_step);
 
     if (relay->period_count >= relay->cfg.cycles) {
-        axxpid__relay_finish(relay);
+        axxpid_relay_estimate(relay);
         if (output != (axxpid_real_t *)0) {
             *output = relay->cfg.output_bias;
         }
@@ -496,7 +505,7 @@ axxpid_gains_t axxpid_relay_gains(const axxpid_relay_t *relay,
 {
     if ((relay == (const axxpid_relay_t *)0) ||
         (relay->state != AXXPID_RELAY_DONE)) {
-        return axxpid__no_gains();
+        return axxpid_zero_gains();
     }
     return axxpid_tune_from_ultimate(rule, relay->ku, relay->tu);
 }
