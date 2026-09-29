@@ -58,7 +58,7 @@ void motor_control_isr(void)
 /* -------------------------------------------------------------------------- */
 
 /* When the control loop shares the main loop with a display, USB and a menu
- * system - as AxxSolder's does - let axxpid_update_at() do the rate limiting.
+ * system, let axxpid_update_at() do the rate limiting.
  * It measures the true elapsed interval, so the occasional late call costs
  * you accuracy rather than correctness. */
 

@@ -4,8 +4,7 @@
  * @version 1.0.0
  * @license MIT
  *
- * AxxPID is a single-translation-unit PID controller extracted from the
- * AxxSolder soldering station firmware and generalised for reuse. It has no
+ * AxxPID is a single-translation-unit PID controller for embedded C. It has no
  * dependency on any vendor HAL, performs no dynamic allocation, and uses no
  * global state: every controller lives in a caller-allocated ::axxpid_t.
  *
@@ -168,8 +167,8 @@ typedef enum {
     /**
      * Conditional integration ("clamping"): integration is frozen for a
      * sample whenever integrating further would push an already-saturated
-     * output deeper into its limit. This is the AxxSolder-proven default:
-     * cheap, branch-only, and it never overshoots the limit at all.
+     * output deeper into its limit. The default: cheap, branch-only, and it
+     * never overshoots the limit at all.
      */
     AXXPID_ANTIWINDUP_CONDITIONAL = 1,
 
@@ -268,10 +267,9 @@ typedef struct {
      * @c integral_band below the setpoint"; for a reverse-acting one the
      * error is negated first, so it means the other way round.
      *
-     * This is the AxxSolder "I min error". During a long ramp the actuator is
-     * flat out anyway, so anything the integral collects there will only come
-     * back as overshoot. Holding it at zero until the error is small avoids
-     * that.
+     * During a long ramp the actuator is flat out anyway, so anything the
+     * integral collects there will only come back as overshoot. Holding it at
+     * zero until the error is small avoids that.
      *
      * Deliberately one-sided. A symmetric version would also dump the integral
      * when the process is far *above* setpoint, which is exactly when a heater
@@ -288,18 +286,18 @@ typedef struct {
      *
      * A soldering iron heats fast but cools only as fast as it loses heat to
      * the air. Once it is above the setpoint the integral has to drain several
-     * times faster than it filled, or the overshoot lasts. AxxSolder uses
-     * 7.0.
+     * times faster than it filled, or the overshoot lasts. A factor of 7 is a
+     * reasonable starting point for a small thermal mass.
      *
      * Default 1.0 (symmetric, i.e. disabled).
      */
     axxpid_real_t integral_overshoot_gain;
 
     /**
-     * Error below which @c integral_overshoot_gain takes effect. AxxSolder uses
-     * -1.0, so a small leftover error does not trip the fast-drain path and
-     * set the loop hunting - slowly oscillating around the setpoint. Default
-     * 0.0.
+     * Error below which @c integral_overshoot_gain takes effect. Use
+     * a small negative value such as -1.0, so a small leftover error does not
+     * trip the fast-drain path and set the loop hunting - slowly oscillating
+     * around the setpoint. Default 0.0.
      */
     axxpid_real_t integral_overshoot_threshold;
 
@@ -318,8 +316,8 @@ typedef struct {
      * the high-frequency gain of the D term at @f$k_p N@f$ instead of letting
      * it grow without limit. Sensible values are 2..20; 8..16 is typical.
      *
-     * Default 0.0 (no filtering), which reproduces the raw derivative used by
-     * AxxSolder. Enable it if your measurement is noisy - see the README.
+     * Default 0.0 (no filtering), so @c kd means exactly what the equation
+     * says. Enable it if your measurement is noisy - see the README.
      */
     axxpid_real_t derivative_filter_n;
 
@@ -753,8 +751,7 @@ axxpid_status_t axxpid_set_integral(axxpid_t *pid, axxpid_real_t value);
  * @brief Clamp the integral term to an explicit range.
  *
  * Independent of the output limits, and the most direct way to cap how much
- * the integrator can ever contribute. AxxSolder runs its heater at +/- 300
- * out of a 0..500 output range.
+ * the integrator can ever contribute.
  *
  * Worth setting. If you do not, ::axxpid_init picks limits a hundred output
  * spans either side of the output range - wide enough never to interfere,

@@ -123,10 +123,6 @@ Measured with `-Os`, **192 bytes of RAM** per controller and no heap at all:
 | Cortex-M0+ (soft float) | 4.7 kB | 2.7 kB |
 | RISC-V rv32imc (no FPU) | 6.3 kB | 4.2 kB |
 
-It is the control loop from the
-[AxxSolder](https://github.com/AxxAxx/AxxSolder) soldering station,
-pulled out and generalised.
-
 ### Will it run on my chip?
 
 Almost certainly. This is plain C99 with no vendor headers, no operating
@@ -388,8 +384,8 @@ axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_CONDITIONAL, 0.0f);
 
 **Conditional integration** (the default). Integration is frozen for a sample
 whenever the step would push an output that is already beyond what the actuator
-can reach further out. Cheap, and it never exceeds the limit at all. This is
-what AxxSolder has run for years.
+can reach further out. Cheap, two comparisons, and it never exceeds the limit
+at all.
 
 ```c
 axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_BACK_CALCULATION, tt);
@@ -405,8 +401,8 @@ axxpid_set_integral_limits(&pid, -300.0f, 300.0f);
 ```
 
 **A hard limit on the integral**, independent of both. The most direct way to
-cap how much the integrator can ever contribute. AxxSolder runs ±300 on a
-0–500 output.
+cap how much the integrator can ever contribute. A soldering station driving a
+0–500 heater output might use ±300.
 
 If you do not set them, `axxpid_init` picks limits ten output spans either side
 of your output range — wide enough never to interfere, but not unbounded.
@@ -448,7 +444,7 @@ controller can do is wait — and a loop tuned for how fast it can push will
 always overshoot, because the authority it uses going up has no counterpart
 coming down.
 
-Two settings exist for this, both from AxxSolder.
+Two settings exist for this.
 
 **Drain the integrator faster than it filled:**
 
@@ -656,7 +652,6 @@ Every rule, the practical notes and the maths are in
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config field and every function, as tables. |
 | [docs/CONTROL_LAW.md](docs/CONTROL_LAW.md) | The exact equations and the order they run in. |
 | [docs/BUILDING.md](docs/BUILDING.md) | Building, the test suite, CI, and the invariants to keep if you change the code. |
-| [docs/PORTING_AXXSOLDER.md](docs/PORTING_AXXSOLDER.md) | Moving from the original AxxSolder PID. |
 | `include/axxpid/axxpid.h` | The authoritative reference — every function documented where it is declared. |
 
 Examples, in the order worth reading them:
@@ -666,7 +661,7 @@ Examples, in the order worth reading them:
 | `examples/01_minimal.c` | A PI loop on a simulated tank. Start here. |
 | `examples/02_feedforward.c` | Three kinds of feed-forward, side by side. |
 | `examples/03_autotune.c` | Autotune, then control with the result. |
-| `examples/04_soldering_iron.c` | The AxxSolder configuration, explained and measured. |
+| `examples/04_soldering_iron.c` | A one-way actuator handled properly, explained and measured. |
 | `examples/stm32_hal_snippet.c` | Both timing patterns in a CubeIDE project. |
 | `examples/arduino/` | An Arduino thermostat sketch. |
 

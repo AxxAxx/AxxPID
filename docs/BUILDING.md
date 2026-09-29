@@ -14,7 +14,7 @@ Four suites:
 |---|---|
 | `test_core` | Lifecycle, argument validation, NULL safety on every entry point, NaN/Inf rejection, tick wraparound, scheduling. |
 | `test_features` | One test per control-law feature, checked against hand-derived arithmetic, plus a regression for every defect found in review. |
-| `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, the AxxSolder profile. |
+| `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, a one-way actuator profile. |
 | `test_tune` | Rule tables against the published coefficients; the relay autotuner against a plant whose true `Ku` and `Tu` are computed numerically in the test. |
 
 808 assertions in total, in both `float` and `double`. Expected values are
@@ -40,7 +40,7 @@ Examples build with the tests and run standalone:
 ./build/01_minimal          # a PI loop on a tank
 ./build/02_feedforward      # three kinds of feed-forward, side by side
 ./build/03_autotune         # relay autotune, then control with the result
-./build/04_soldering_iron   # the AxxSolder configuration, explained
+./build/04_soldering_iron   # a one-way actuator, explained
 ```
 
 ---

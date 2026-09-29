@@ -1,6 +1,6 @@
 /**
  * @file  04_soldering_iron.c
- * @brief The AxxSolder configuration, and what each of its knobs is for.
+ * @brief Controlling a one-way actuator, and what each setting is for.
  *
  * AxxPID's less usual features - the integral engagement band, the asymmetric
  * integral gain, the explicit integral clamp - all exist because a soldering
@@ -21,9 +21,9 @@
 
 #include "axxpid/axxpid.h"
 
-#define DT        0.025f /* 25 ms, the AxxSolder control period.            */
+#define DT        0.025f /* 25 ms control period.                           */
 #define AMBIENT   25.0f
-#define MAX_POWER 500.0f /* Matches AxxSolder's PID_MAX_OUTPUT.             */
+#define MAX_POWER 500.0f /* Full heater power, in output units.             */
 
 /* Two-node thermal model: heating element -> tip -> air. */
 #define ELEMENT_MASS  1.0f  /* Heat capacity of the element.                */
@@ -65,10 +65,10 @@ static float iron_step(iron_t *iron, float power, float load)
     return iron->tip;
 }
 
-/** @brief Configure a controller exactly the way AxxSolder does. */
-static void configure_axxsolder(axxpid_t *pid)
+/** @brief Configure a controller for a small, one-way thermal load. */
+static void configure_soldering_iron(axxpid_t *pid)
 {
-    /* Gains from the T245 tip profile, and the heater PWM range. */
+    /* Gains for a T245-sized tip, and the heater PWM range. */
     axxpid_init(pid, 8.0f, 2.0f, 0.5f, 0.0f, MAX_POWER);
 
     /* Cap how much authority the integrator can ever hold. Without this the
@@ -104,7 +104,7 @@ static void scenario_heat_up(void)
     float peak = AMBIENT;
     int step;
 
-    configure_axxsolder(&pid);
+    configure_soldering_iron(&pid);
     iron_init(&iron);
     tip = iron.tip;
 
@@ -121,8 +121,7 @@ static void scenario_heat_up(void)
         }
 
         if ((step % 300) == 0) {
-            /* The same breakdown AxxSolder graphs on its display, and the
-             * direct equivalent of its PID_GetPpart/Ipart/Dpart. */
+            /* The breakdown you would graph on a display while tuning. */
             axxpid_terms_t terms;
 
             axxpid_get_terms(&pid, &terms);
@@ -155,7 +154,7 @@ static void scenario_load_transient(void)
     } variants[] = {
         {"symmetric integral", 1.0f},
         {"asymmetric, 3x", 3.0f},
-        {"asymmetric, 7x (AxxSolder)", 7.0f},
+        {"asymmetric, 7x", 7.0f},
     };
     size_t v;
 
@@ -169,7 +168,7 @@ static void scenario_load_transient(void)
         float charged;
         int step;
 
-        configure_axxsolder(&pid);
+        configure_soldering_iron(&pid);
         axxpid_set_integral_overshoot(&pid, variants[v].asymmetry, -1.0f);
         iron_init(&iron);
         tip = iron.tip;
@@ -211,7 +210,7 @@ static void scenario_sleep(void)
     float tip;
     int step;
 
-    configure_axxsolder(&pid);
+    configure_soldering_iron(&pid);
     iron_init(&iron);
     tip = iron.tip;
 

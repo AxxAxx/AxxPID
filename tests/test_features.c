@@ -312,8 +312,8 @@ static void test_antiwindup_back_calculation(void)
     CHECK(axxpid_get_i_term(&pid) < 50);
 }
 
-/* AxxSolder's integral engagement band: park the integrator while the process
- * is still a long way below the setpoint. */
+/* The integral engagement band: park the integrator while the process is
+ * still a long way below the setpoint. */
 static void test_integral_band(void)
 {
     axxpid_t pid;
@@ -343,7 +343,7 @@ static void test_integral_band(void)
     CHECK_NEAR(axxpid_get_i_term(&pid), -150, AXXPID_C(1e-2));
 }
 
-/* AxxSolder's asymmetric integral gain: unwind faster than you wind up. */
+/* Asymmetric integral gain: unwind faster than you wind up. */
 static void test_integral_asymmetry(void)
 {
     axxpid_t pid;

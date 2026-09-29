@@ -401,9 +401,9 @@ static void test_jittery_sample_time(void)
               "jittery loop settled at %.3f", (double)pv_b);
 }
 
-/* The AxxSolder configuration, end to end, on a soldering-iron-shaped plant:
- * a heater that can only add heat and an asymmetric integrator to match. */
-static void test_axxsolder_profile(void)
+/* A one-way actuator, end to end, on a soldering-iron-shaped plant: a heater
+ * that can only add heat, and an asymmetric integrator to match. */
+static void test_one_way_actuator_profile(void)
 {
     axxpid_t pid;
     axxpid_plant_t plant;
@@ -584,7 +584,7 @@ static const axxpid_test_case_t tests[] = {
     {"load disturbance is rejected", test_disturbance_rejection},
     {"reverse-acting closed loop", test_reverse_acting_closed_loop},
     {"jittery sample time reaches the same place", test_jittery_sample_time},
-    {"AxxSolder soldering-iron profile", test_axxsolder_profile},
+    {"one-way actuator profile", test_one_way_actuator_profile},
 };
 
 AXXPID_TEST_MAIN("closed loop", tests)
