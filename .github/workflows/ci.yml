@@ -7,21 +7,39 @@ on:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }} / ${{ matrix.cc }} / ${{ matrix.precision }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        cc: [default]
-        precision: [float]
         include:
-          - os: ubuntu-latest
+          - name: linux / gcc / float
+            os: ubuntu-latest
+            cc: gcc
+            double: "OFF"
+            strict: "ON"
+          - name: linux / gcc / double
+            os: ubuntu-latest
+            cc: gcc
+            double: "ON"
+            strict: "ON"
+          - name: linux / clang / float
+            os: ubuntu-latest
             cc: clang
-            precision: float
-          - os: ubuntu-latest
-            cc: default
-            precision: double
+            double: "OFF"
+            strict: "ON"
+          - name: macos / clang / float
+            os: macos-latest
+            cc: clang
+            double: "OFF"
+            strict: "ON"
+          # MSVC has its own warning set that this project has not been
+          # audited against, so it builds and runs the tests without /WX.
+          - name: windows / msvc / float
+            os: windows-latest
+            cc: ""
+            double: "OFF"
+            strict: "OFF"
 
     steps:
       - uses: actions/checkout@v4
@@ -29,11 +47,11 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          if [ "${{ matrix.cc }}" = "clang" ]; then export CC=clang; fi
+          if [ -n "${{ matrix.cc }}" ]; then export CC="${{ matrix.cc }}"; fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DAXXPID_STRICT=ON \
-            -DAXXPID_USE_DOUBLE=${{ matrix.precision == 'double' && 'ON' || 'OFF' }}
+            -DAXXPID_STRICT=${{ matrix.strict }} \
+            -DAXXPID_USE_DOUBLE=${{ matrix.double }}
 
       - name: Build
         run: cmake --build build --config Release
@@ -42,45 +60,51 @@ jobs:
         run: ctest --test-dir build --build-config Release --output-on-failure
 
   cross-compile:
-    name: arm-none-eabi (Cortex-M4F)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm-none-eabi (Cortex-M4F, hard float)
+            flags: >-
+              -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb
+          - name: arm-none-eabi (Cortex-M0+, soft float)
+            flags: -mcpu=cortex-m0plus -mthumb
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install the ARM toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
 
-      # The library must build for a real embedded target with no libc
-      # startup, no libm and no heap.
-      - name: Compile for Cortex-M4F
+      # It must build for a real embedded target: no libc startup, no libm,
+      # no heap.
+      - name: Compile
         run: |
           arm-none-eabi-gcc -c src/axxpid.c src/axxpid_tune.c \
-            -Iinclude \
-            -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb \
+            -Iinclude ${{ matrix.flags }} \
             -std=c99 -Os -ffreestanding \
             -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
             -Wdouble-promotion -Wstrict-prototypes -Wmissing-prototypes \
             -Werror
 
       - name: Report code size
-        run: |
-          arm-none-eabi-size -t axxpid.o axxpid_tune.o
+        run: arm-none-eabi-size -t axxpid.o axxpid_tune.o
 
-  cross-compile-m0:
-    name: arm-none-eabi (Cortex-M0+, no FPU)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
-      - name: Compile for Cortex-M0+
+      # The only external symbol either object may need is memcpy, which the
+      # compiler emits for a struct copy. Anything else means a dependency
+      # has crept in.
+      - name: Check for unexpected dependencies
         run: |
-          arm-none-eabi-gcc -c src/axxpid.c src/axxpid_tune.c \
-            -Iinclude -mcpu=cortex-m0plus -mthumb \
-            -std=c99 -Os -ffreestanding \
-            -Wall -Wextra -Wpedantic -Werror
-      - run: arm-none-eabi-size -t axxpid.o axxpid_tune.o
+          undefined=$(arm-none-eabi-nm -u axxpid.o axxpid_tune.o \
+                      | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | sort -u \
+                      | grep -vE '^(memcpy|axxpid_set_tunings|__aeabi_\w+|__gnu_\w+)$' || true)
+          if [ -n "$undefined" ]; then
+            echo "::error::unexpected external symbols: $undefined"
+            exit 1
+          fi
+          echo "no unexpected dependencies"
 
   c-standards:
     name: C99 / C11 / C17
@@ -91,8 +115,10 @@ jobs:
         run: |
           for std in c99 c11 c17; do
             echo "=== $std ==="
-            gcc -c src/axxpid.c src/axxpid_tune.c -Iinclude \
-              -std=$std -Wall -Wextra -Wpedantic -Werror -o /dev/null
+            for file in src/axxpid.c src/axxpid_tune.c; do
+              gcc -c "$file" -Iinclude -std=$std \
+                -Wall -Wextra -Wpedantic -Werror -o /dev/null
+            done
           done
 
   reserved-identifiers:
@@ -100,58 +126,69 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # C reserves identifiers with a leading underscore; C++ reserves any
-      # identifier containing a doubled underscore anywhere. These sources are
-      # compiled by C++ toolchains too, so neither may appear -- except for
-      # the compiler's own predefined macros, which we are meant to test.
-      - name: Scan headers and sources
-        run: |
-          python3 - <<'PY'
-          import re, sys, pathlib
-
-          ALLOWED = re.compile(
-              r"^__(FILE|LINE|DATE|TIME|func|VA_ARGS|cplusplus|STDC\w*|"
-              r"GNUC\w*|clang\w*|has_\w+|attribute)(__)?$")
-          IDENT = re.compile(r"_*[A-Za-z_][A-Za-z0-9_]*")
-
-          bad = []
-          for path in sorted(pathlib.Path("include").rglob("*.h")) +                       sorted(pathlib.Path("src").rglob("*.c")):
-              text = path.read_text(encoding="utf-8")
-              # Strip comments so prose about "__" does not trip the scan.
-              text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-              text = re.sub(r"//[^
-]*", " ", text)
-              for n, line in enumerate(text.splitlines(), 1):
-                  for ident in IDENT.findall(line):
-                      if ALLOWED.match(ident):
-                          continue
-                      if ident.startswith("_") or "__" in ident:
-                          bad.append("%s:%d: %s" % (path, n, ident))
-
-          if bad:
-              for b in bad:
-                  print("::error::reserved identifier -> " + b)
-              sys.exit(1)
-          print("clean: no reserved identifiers")
-          PY
+      - run: python3 tools/check_identifiers.py
 
   cpp-compatibility:
     name: Usable from C++
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Include the headers from a C++ translation unit
+      - name: Compile and run from a C++ translation unit
         run: |
           cat > cpp_check.cpp <<'CPP'
+          #include <cstdio>
+
           #include "axxpid/axxpid.h"
           #include "axxpid/axxpid_tune.h"
-          int main() {
+
+          int main()
+          {
               axxpid_t pid;
-              axxpid_init(&pid, 1.0f, 1.0f, 0.0f);
-              axxpid_set_output_limits(&pid, 0.0f, 100.0f);
-              return axxpid_update(&pid, 10.0f, 0.0f, 0.1f) > 0.0f ? 0 : 1;
+              axxpid_gains_t gains;
+
+              if (axxpid_init(&pid, 1.0f, 1.0f, 0.0f, 0.0f, 100.0f) != AXXPID_OK) {
+                  return 1;
+              }
+              gains = axxpid_tune_from_ultimate(AXXPID_RULE_ZN_PID, 10.0f, 4.0f);
+              if (axxpid_tune_apply(&pid, &gains) != AXXPID_OK) {
+                  return 1;
+              }
+
+              float u = axxpid_update(&pid, 10.0f, 0.0f, 0.1f);
+              std::printf("output %.3f\n", static_cast<double>(u));
+              return (u > 0.0f) ? 0 : 1;
           }
           CPP
-          g++ cpp_check.cpp src/axxpid.c src/axxpid_tune.c -Iinclude \
-            -x none -Wall -Wextra -Werror -o cpp_check
+          # The realistic case: the library is compiled as C, then linked
+          # into a C++ program. That is what the extern "C" guard is for.
+          # Note that g++ would compile a .c file as C++, testing something
+          # else entirely, so the two languages are kept apart explicitly.
+          gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c src/axxpid.c -o axxpid.o
+          gcc -std=c99 -Wall -Wextra -Werror -Iinclude -c src/axxpid_tune.c -o axxpid_tune.o
+          g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -c cpp_check.cpp -o cpp_check.o
+          g++ axxpid.o axxpid_tune.o cpp_check.o -o cpp_check
           ./cpp_check
+
+      # A bonus rather than a requirement: the sources happen to be valid C++
+      # as well, which helps anyone dropping them into a C++ build.
+      - name: Compile the sources themselves as C++
+        run: |
+          g++ -std=c++17 -x c++ -Wall -Wextra -Iinclude -c src/axxpid.c -o /dev/null
+          g++ -std=c++17 -x c++ -Wall -Wextra -Iinclude -c src/axxpid_tune.c -o /dev/null
+
+  examples:
+    name: Examples build and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run each example
+        run: |
+          for example in examples/0*.c; do
+            name=$(basename "$example" .c)
+            echo "=== $name ==="
+            gcc -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Werror \
+              -Iinclude src/axxpid.c src/axxpid_tune.c "$example" \
+              -o "/tmp/$name"
+            "/tmp/$name" > /dev/null
+          done
+          echo "all examples built and ran"
