@@ -318,6 +318,14 @@ typedef struct {
      *
      * Default 0.0 (no filtering), so @c kd means exactly what the equation
      * says. Enable it if your measurement is noisy - see the README.
+     *
+     * @warning @f$N@f$ only bites when @f$T_d@f$ is much longer than your
+     *          sample period. With @c kp = 12 and @c kd = 8, @f$T_d@f$ is
+     *          0.67 s, so even @f$N = 10@f$ leaves a 67 ms filter - against a
+     *          250 ms sample period that does almost nothing, and a larger
+     *          @f$N@f$ makes it weaker still. When the two are comparable,
+     *          use ::axxpid_set_derivative_filter_tau and say what you want
+     *          in seconds.
      */
     axxpid_real_t derivative_filter_n;
 

@@ -32,8 +32,14 @@ void motor_control_init(void)
     /* Symmetric drive: full reverse to full forward. */
     axxpid_init(&motor_pid, 0.8f, 12.0f, 0.004f, -1000.0f, 1000.0f);
 
-    /* An encoder differentiated at 1 kHz is noisy; filter the derivative. */
-    axxpid_set_derivative_filter(&motor_pid, 12.0f);
+    /* An encoder differentiated at 1 kHz is noisy, so filter the derivative.
+     *
+     * Note this asks in seconds rather than using the N form. N sets the
+     * filter to Td/N, where Td = kd/kp - here 0.004/0.8 = 5 ms, so N = 12
+     * would leave a 0.4 ms filter against a 1 ms sample period, which barely
+     * filters at all. The N form only bites when Td is much longer than the
+     * sample period; when it is not, say what you want directly. */
+    axxpid_set_derivative_filter_tau(&motor_pid, 0.005f);
 
     /* Protect the gearbox from a step command. */
     axxpid_set_output_slew_rate(&motor_pid, 20000.0f);
@@ -42,7 +48,8 @@ void motor_control_init(void)
 /** @brief Call from HAL_TIM_PeriodElapsedCallback for your control timer. */
 void motor_control_isr(void)
 {
-    extern float speed_setpoint_rpm;
+    /* volatile: written by the main loop, read here in interrupt context. */
+    extern volatile float speed_setpoint_rpm;
     extern float encoder_read_rpm(void);
     extern void motor_set_duty(int32_t duty);
 
@@ -82,8 +89,21 @@ void heater_control_poll(void)
     extern float thermocouple_read_celsius(void);
     extern void heater_set_power(float power);
 
-    if (axxpid_update_at(&heater_pid, target_temperature,
-                         thermocouple_read_celsius(), HAL_GetTick())) {
+    const float measured = thermocouple_read_celsius();
+
+    /* Range-check the sensor yourself. AxxPID rejects a NaN or an infinity,
+     * but an open thermocouple usually reads as a plausible number - often
+     * near zero - and the controller will then hold the heater at full power
+     * trying to warm up something it cannot see. Only your code knows what
+     * "plausible" means for this process. */
+    if ((measured < -20.0f) || (measured > 500.0f)) {
+        heater_set_power(0.0f);
+        axxpid_reset(&heater_pid);  /* do not carry the integral over a fault */
+        return;
+    }
+
+    if (axxpid_update_at(&heater_pid, target_temperature, measured,
+                         HAL_GetTick())) {
         /* Only true on the samples where the controller actually ran. */
         heater_set_power(axxpid_get_output(&heater_pid));
     }

@@ -37,8 +37,12 @@ int main(void)
     axxpid_relay_state_t state = AXXPID_RELAY_RUNNING;
     axxpid_gains_t gains;
     axxpid_t pid;
-    float ku = 0.0f;
-    float tu = 0.0f;
+    /* These are written through by the library, so they must be its own
+     * scalar type. A `float` here is silently four bytes too small when the
+     * library is built with -DAXXPID_USE_DOUBLE=1, and the write runs off the
+     * end of it. */
+    axxpid_real_t ku = 0;
+    axxpid_real_t tu = 0;
     float measurement;
     long i;
 
@@ -70,7 +74,7 @@ int main(void)
 
     measurement = plant.value;
     for (i = 0; i < 2000000L; ++i) {
-        float output = 0.0f;
+        axxpid_real_t output = 0; /* written through by the library */
 
         state = axxpid_relay_update(&relay, measurement, DT, &output);
         if (state != AXXPID_RELAY_RUNNING) {
@@ -85,8 +89,17 @@ int main(void)
     }
 
     axxpid_relay_result(&relay, &ku, &tu);
-    (void)printf("  ultimate gain Ku = %.3f\n", (double)ku);
-    (void)printf("  ultimate period Tu = %.3f s\n\n", (double)tu);
+    (void)printf("  ultimate gain Ku   = %.3f\n", (double)ku);
+    (void)printf("  ultimate period Tu = %.3f s\n", (double)tu);
+
+    /* This example knows its own plant, so it can show how good the estimate
+     * is. Solving the FOPDT phase condition for K = 0.8, L = 2.56 s, T = 8 s
+     * gives the true values below. A relay estimate reads Ku low - the
+     * describing function keeps only the fundamental of a square wave - and
+     * that is fine, because every tuning rule has a safety factor built in
+     * and a low Ku gives gentle gains. */
+    (void)printf("  (true values for this plant: Ku = 6.955, Tu = 9.183 s;\n");
+    (void)printf("   a relay reads Ku low by 10-20%%, which is expected)\n\n");
 
     /* ---------------------------------------------------------------- */
     /* Step 2: turn the measurement into gains.                          */
@@ -113,9 +126,10 @@ int main(void)
         }
     }
 
-    /* Tyreus-Luyben is the sane default: roughly a third of the Ziegler-
-     * Nichols gain, which is what you want on anything with noise or a
-     * varying load. Start here and tighten only if you need to. */
+    /* Tyreus-Luyben is the sane default. On this plant it is about
+     * three-quarters of the Ziegler-Nichols proportional gain but roughly six
+     * times slower on the integral, which is where the calm comes from. Start
+     * here and tighten only if you need to. */
     gains = axxpid_relay_gains(&relay, AXXPID_RULE_TYREUS_LUYBEN_PID);
 
     /* ---------------------------------------------------------------- */

@@ -151,10 +151,12 @@ static void scenario_load_transient(void)
     const struct {
         const char *label;
         float asymmetry;
+        int park_integral; /* cheat: hand the loop a perfect integrator */
     } variants[] = {
-        {"symmetric integral", 1.0f},
-        {"asymmetric, 3x", 3.0f},
-        {"asymmetric, 7x", 7.0f},
+        {"symmetric integral", 1.0f, 0},
+        {"asymmetric, 3x", 3.0f, 0},
+        {"asymmetric, 7x", 7.0f, 0},
+        {"perfect integrator (the floor)", 1.0f, 1},
     };
     size_t v;
 
@@ -167,6 +169,7 @@ static void scenario_load_transient(void)
         float peak = 0.0f;
         float charged;
         int step;
+        float unloaded_integral;
 
         configure_soldering_iron(&pid);
         axxpid_set_integral_overshoot(&pid, variants[v].asymmetry, -1.0f);
@@ -177,11 +180,20 @@ static void scenario_load_transient(void)
         for (step = 0; step < 8000; ++step) {
             tip = iron_step(&iron, axxpid_update(&pid, 330.0f, tip, DT), 0.0f);
         }
+        unloaded_integral = axxpid_get_integral(&pid);
         /* 80 s on a big joint drawing heat away. */
         for (step = 0; step < 3200; ++step) {
             tip = iron_step(&iron, axxpid_update(&pid, 330.0f, tip, DT), 55.0f);
         }
         charged = axxpid_get_i_term(&pid);
+
+        /* The last variant cheats: at the instant of lift the integrator is
+         * put straight back where it sat with no load. No controller setting
+         * can do better than that, so whatever overshoot survives it is not
+         * the integrator's fault at all. */
+        if (variants[v].park_integral) {
+            axxpid_set_integral(&pid, unloaded_integral);
+        }
 
         /* Iron lifted: the load vanishes instantly. */
         for (step = 0; step < 8000; ++step) {
@@ -197,9 +209,13 @@ static void scenario_load_transient(void)
     }
 
     (void)printf(
-        "\nDraining the integrator faster than it filled cuts the overshoot\n"
-        "with no cost to the heat-up, because the fast path only ever runs\n"
-        "while the tip is already above target.\n\n");
+        "\nRead the last row first. Even with the integrator made perfect at\n"
+        "the moment of lift, a few degrees of overshoot remain: that is heat\n"
+        "already stored in the element, and no controller setting can reach\n"
+        "it. The gap between the first row and the last is the part the\n"
+        "integrator is responsible for, and draining it faster recovers a\n"
+        "good share of that. It costs nothing on the way up, because the\n"
+        "fast path only runs while the tip is above target.\n\n");
 }
 
 /** @brief Setpoint zero means off, and the controller must let go completely. */

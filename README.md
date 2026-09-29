@@ -175,9 +175,19 @@ lib_deps = https://github.com/AxxAxx/AxxPID.git
 **STM32CubeIDE**: copy `include/axxpid/` and `src/` into the project, add
 `src/axxpid.c` to the build and `include/` to the include paths.
 
-**Arduino IDE**: copy `include/axxpid/` and `src/*.c` into
-`Arduino/libraries/AxxPID/src/`, so the layout is `src/axxpid/axxpid.h` and
-`src/axxpid.c`.
+**Arduino IDE**: the IDE only compiles what it finds under `src/`, so create
+`Arduino/libraries/AxxPID/` and arrange it like this:
+
+```
+library.properties      (copied from the repository root)
+src/axxpid.c
+src/axxpid_tune.c       (only if you want the autotuner)
+src/axxpid/axxpid.h
+src/axxpid/axxpid_tune.h
+```
+
+`library.properties` is what tells the IDE to look inside `src/` at all —
+without it the sketch will not find the headers.
 
 To run in `double` instead of `float`, define `AXXPID_USE_DOUBLE=1`. On any MCU
 with a single-precision FPU, don't.
@@ -431,6 +441,16 @@ axxpid_set_derivative_filter(&pid, 10.0f);   /* N, typically 8..16 */
 action left; above about 20 there is no filtering left. **This is off by
 default**, so `kd` means exactly what the equation says — but turn it on for
 almost any real sensor.
+
+One trap. `N` sets the filter to `Td/N`, where `Td = kd/kp`, so it only does
+much when `Td` is a lot longer than your sample period. With `kp = 12` and
+`kd = 8`, `Td` is 0.67 s — even `N = 10` leaves a 67 ms filter, which against
+a 250 ms sample period barely filters at all, and raising `N` makes it weaker.
+When the two are comparable, ask in seconds instead:
+
+```c
+axxpid_set_derivative_filter_tau(&pid, 1.0f);   /* seconds */
+```
 
 The filter coefficient is recomputed from the measured `dt` every sample, so an
 irregular loop period cannot quietly move the cut-off frequency.

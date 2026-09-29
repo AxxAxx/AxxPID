@@ -32,19 +32,19 @@ int main(void)
 
     printf("  time    level   valve\n");
 
-    for (step = 0; step < 700; ++step) {
+    for (step = 0; step < 1600; ++step) {
         /* ---- the whole integration ---- */
         float valve = axxpid_update(&pid, setpoint, level, DT);
         /* ------------------------------- */
 
         level = tank_step(level, valve);
 
-        if (step % 50 == 0) {
+        if (step % 100 == 0) {
             printf("%6.2f s %7.2f %7.2f\n", step * DT, level, valve);
         }
 
-        if (step == 200) {
-            setpoint = 40.0f; /* Halfway through, ask for less. */
+        if (step == 400) {
+            setpoint = 40.0f; /* A third of the way in, ask for less. */
         }
     }
 

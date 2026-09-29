@@ -177,8 +177,20 @@ jobs:
           g++ -std=c++17 -x c++ -Wall -Wextra -Iinclude -c src/axxpid_tune.c -o /dev/null
 
   examples:
-    name: Examples build and run
+    name: Examples build and run (${{ matrix.precision }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - precision: float
+            define: ""
+          # The header tells users they may build in double precision, so
+          # the examples have to survive it. They did not: one failed to
+          # compile, and one wrote eight bytes into a four-byte float and
+          # crashed.
+          - precision: double
+            define: "-DAXXPID_USE_DOUBLE=1"
     steps:
       - uses: actions/checkout@v4
       - name: Build and run each example
@@ -187,6 +199,7 @@ jobs:
             name=$(basename "$example" .c)
             echo "=== $name ==="
             gcc -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Werror \
+              ${{ matrix.define }} \
               -Iinclude src/axxpid.c src/axxpid_tune.c "$example" \
               -o "/tmp/$name"
             "/tmp/$name" > /dev/null

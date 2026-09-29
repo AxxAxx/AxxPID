@@ -28,7 +28,12 @@
  * here: a polynomial, a lookup table, an inverse plant model, or a term from
  * a measured disturbance such as airflow.
  */
-static float holding_power(float setpoint, float measurement, void *user)
+/* The signature has to match axxpid_ff_fn_t exactly. axxpid_real_t is float
+ * unless you build with -DAXXPID_USE_DOUBLE=1; writing `float` here compiles
+ * in the default build and then fails to compile in the other one. */
+static axxpid_real_t holding_power(axxpid_real_t setpoint,
+                                   axxpid_real_t measurement,
+                                   void *user)
 {
     (void)measurement;
     (void)user;
