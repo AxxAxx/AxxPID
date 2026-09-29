@@ -68,7 +68,7 @@ First release.
 
 ### Verification
 
-- 808 assertions across four suites, in both `float` and `double`. Expected
+- 115 tests across four suites, run in both `float` and `double`. Expected
   values are derived from the difference equations or from the published
   tuning tables, never recorded from a previous run.
 - Mutation tested: twenty deliberately broken copies of the library are built

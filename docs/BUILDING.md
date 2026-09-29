@@ -17,7 +17,9 @@ Four suites:
 | `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, a one-way actuator profile. |
 | `test_tune` | Rule tables against the published coefficients; the relay autotuner against a plant whose true `Ku` and `Tu` are computed numerically in the test. |
 
-808 assertions in total, in both `float` and `double`. Expected values are
+115 tests in total, run in both `float` and `double`. (The suites print a
+count of *checks* executed, which is larger because some tests loop; 115 is
+the number of distinct things being tested.) Expected values are
 derived from the difference equations above or from the published tuning
 tables, not recorded from a previous run, so they catch a change in behaviour
 rather than merely pinning it.
