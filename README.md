@@ -1,38 +1,75 @@
 # AxxPID
 
-A PID controller for C that you can drop into any project and trust.
-
-No dependencies — not even `<math.h>`; the one square root the autotuner needs
-is in the box. No dynamic allocation, no globals, no vendor HAL. One `.c` file
-and one header for the controller, one more pair if you want the autotuner.
-Every controller lives in a struct you allocate yourself, so you can have as
-many as you like, on the stack, in `.bss`, or inside another struct.
-
-Compiled freestanding for a Cortex-M4F, the only external symbol either object
-file references is `memcpy`, which the compiler emits for a struct copy and
-every toolchain provides.
-
-It is the control loop from the [AxxSolder](https://github.com/AxelJohanssonSWE/AxxSolder)
-soldering station, pulled out and generalised. The unusual features — the
-integral engagement band, the asymmetric integral gain, the explicit integral
-clamp — are there because a soldering iron needed them, and they turn out to
-be useful on anything with a one-way actuator.
+A PID controller for embedded C. Two files, no dependencies.
 
 ```c
 #include "axxpid/axxpid.h"
 
 axxpid_t pid;
 
-/*          kp    ki    kd    out_min  out_max */
-axxpid_init(&pid, 8.0f, 2.0f, 0.5f,    0.0f, 100.0f);
+/*          kp    ki    kd     min    max   */
+axxpid_init(&pid, 8.0f, 2.0f, 0.5f,  0.0f, 100.0f);
 
 for (;;) {
-    float power = axxpid_update(&pid, setpoint, read_sensor(), 0.010f);
-    drive_heater(power);
+    float power = axxpid_update(&pid, 250.0f, read_sensor(), 0.010f);
+    set_heater(power);
 }
 ```
 
-That is the whole integration. Everything below is optional.
+That is a complete, working temperature controller. Everything below is
+optional.
+
+---
+
+## Start here
+
+**1. Copy two files into your project.**
+
+```
+include/axxpid/axxpid.h
+src/axxpid.c
+```
+
+Add `include/` to your include path. There is no configuration step and nothing
+to initialise at startup. For CMake, PlatformIO, Arduino and STM32CubeIDE, see
+[Installing](#installing).
+
+**2. Make one controller per thing you are controlling.**
+
+```c
+axxpid_t pid;
+axxpid_init(&pid, kp, ki, kd, out_min, out_max);
+```
+
+`out_min` and `out_max` are the real range of your actuator — 0 to 255 for an
+8-bit PWM, 0 to 100 for a percentage, −1000 to 1000 for a motor that runs both
+ways. They are arguments rather than a later call because the controller needs
+them to protect itself.
+
+**3. Call it at a steady rate and drive your actuator with what it returns.**
+
+```c
+float u = axxpid_update(&pid, setpoint, measurement, dt);
+```
+
+- **setpoint** — the value you want.
+- **measurement** — what your sensor reads right now.
+- **dt** — seconds since you last called it. `0.010f` for a 100 Hz loop.
+
+That is the whole integration. If you do not know what gains to use, go to
+[Tuning](#tuning). You will not break anything by getting them wrong; the loop
+will just be slow, or it will oscillate.
+
+**Two things worth knowing on day one:**
+
+- If a bigger output makes your reading go **down** — a cooler, a brake, a
+  drain valve — add `axxpid_set_acting(&pid, AXXPID_ACTING_REVERSE);`
+- If your sensor is noisy and you are using `kd`, add
+  `axxpid_set_derivative_filter(&pid, 10.0f);` — see
+  [The derivative](#the-derivative).
+
+Build and run `examples/01_minimal.c` on your desktop to watch a loop settle
+before you put anything on hardware.
 
 ---
 
@@ -40,27 +77,20 @@ That is the whole integration. Everything below is optional.
 
 - [Why this one](#why-this-one)
 - [Installing](#installing)
-- [The 90% case](#the-90-case)
-- [Units, and the mistake everyone makes](#units-and-the-mistake-everyone-makes)
+- [Units: the mistake everyone makes](#units-the-mistake-everyone-makes)
 - [Timing](#timing)
+- [Tuning](#tuning)
+- [Watching what it does](#watching-what-it-does)
 - [Feed-forward](#feed-forward)
 - [Anti-windup](#anti-windup)
 - [The derivative](#the-derivative)
-- [Setpoint weighting](#setpoint-weighting)
-- [Manual mode and bumpless transfer](#manual-mode-and-bumpless-transfer)
 - [One-way actuators](#one-way-actuators)
 - [Output shaping](#output-shaping)
-- [Reverse-acting processes](#reverse-acting-processes)
-- [Watching what it does](#watching-what-it-does)
-- [Tuning](#tuning)
+- [Manual mode](#manual-mode)
+- [Softening setpoint changes](#softening-setpoint-changes)
 - [Autotuning](#autotuning)
-- [The control law in full](#the-control-law-in-full)
-- [API reference](#api-reference)
-- [Configuration reference](#configuration-reference)
 - [Limitations and gotchas](#limitations-and-gotchas)
-- [Building and testing](#building-and-testing)
-- [Porting from the AxxSolder PID](#porting-from-the-axxsolder-pid)
-- [License](#license)
+- [More documentation](#more-documentation)
 
 ---
 
@@ -68,41 +98,45 @@ That is the whole integration. Everything below is optional.
 
 Most small PID libraries give you `kp`, `ki`, `kd` and an output clamp, and
 stop. That is enough for a demo and not enough for a product. AxxPID adds the
-things you end up writing yourself anyway:
+things you end up writing yourself anyway.
 
 | | |
 |---|---|
-| **Feed-forward, first class** | Constant, setpoint-proportional, setpoint-rate, or your own callback. Applied *inside* the saturation calculation, which is the part everyone gets wrong. |
-| **Derivative on measurement, filtered** | No derivative kick on a setpoint step, and an Åström–Hägglund filter so the D term does not just amplify your ADC noise. |
-| **Anti-windup you choose** | Conditional integration or back-calculation, plus an explicit clamp on the integral itself. |
-| **Bumpless everything** | Manual↔automatic transfer, retuning mid-flight, and resuming from a known actuator position. |
+| **Feed-forward, first class** | Apply the output you already know a setpoint needs, instead of waiting for the loop to discover it. |
+| **A derivative that survives a real sensor** | Taken from the measurement, so a setpoint change does not spike the output, and filtered so it does not amplify noise. |
+| **Anti-windup you choose** | Two strategies, plus a hard limit on the integral. |
+| **Bumpless everything** | Switch to manual and back, or retune mid-flight, without the output jumping. |
 | **Real elapsed time** | `ki` and `kd` mean the same thing whether your loop runs at 25 ms or jitters between 20 and 40. |
-| **Introspection** | Read the P, I and D contributions separately — the single most useful thing you can do while tuning. |
-| **Asymmetric integral** | Because a heater can heat but cannot cool, and a symmetric integrator will always overshoot on a one-way actuator. |
-| **Autotuner included** | Relay feedback, plus the Ziegler–Nichols, Cohen–Coon, Tyreus–Luyben and lambda/SIMC tables. |
-| **Actually tested** | 808 assertions across four suites, plus mutation testing: deliberately broken copies of the library are checked to confirm the tests catch them. |
+| **You can see inside it** | Read the P, I and D contributions separately — the fastest way to work out why a loop misbehaves. |
+| **Built for one-way actuators** | A heater can heat but not cool. AxxPID has the asymmetry that needs. |
+| **Autotuner included** | Measures your process and picks gains for you. |
 
-Measured with `arm-none-eabi-gcc 13.3 -Os`, **192 bytes of RAM** per controller
-instance and no heap at all:
+No dynamic allocation, no globals, no vendor HAL, not even `<math.h>`. Every
+controller lives in a struct you allocate yourself, so you can have as many as
+you like — on the stack, in `.bss`, or inside another struct.
 
-| Target | Controller | + tuning module |
+Measured with `arm-none-eabi-gcc -Os`, **192 bytes of RAM** per controller and
+no heap at all:
+
+| Target | Controller | + autotuner |
 |---|---|---|
 | Cortex-M4F (hard float) | 4.4 kB | 2.3 kB |
 | Cortex-M0+ (soft float) | 4.7 kB | 2.7 kB |
+
+It is the control loop from the
+[AxxSolder](https://github.com/AxelJohanssonSWE/AxxSolder) soldering station,
+pulled out and generalised.
 
 ---
 
 ## Installing
 
-**Copy the files.** Two of them, or four with the autotuner:
+**Copy the files.** Two of them, or four if you want the autotuner:
 
 ```
 include/axxpid/axxpid.h       src/axxpid.c
 include/axxpid/axxpid_tune.h  src/axxpid_tune.c
 ```
-
-Add `include/` to your include path. That is it — there is no configuration
-step and no build-time setup.
 
 **CMake**, as a subdirectory or via `FetchContent`:
 
@@ -118,53 +152,20 @@ lib_deps = https://github.com/axeljohansson/AxxPID.git
 ```
 
 **STM32CubeIDE**: copy `include/axxpid/` and `src/` into the project, add
-`src/axxpid.c` to the build and `include/` to the include paths. There is no
-library-wide init and no link-order requirement; each controller is
-initialised on its own with `axxpid_init`.
+`src/axxpid.c` to the build and `include/` to the include paths.
 
 **Arduino IDE**: copy `include/axxpid/` and `src/*.c` into
 `Arduino/libraries/AxxPID/src/`, so the layout is `src/axxpid/axxpid.h` and
 `src/axxpid.c`.
 
-To run the controller in `double` instead of `float`, define
-`AXXPID_USE_DOUBLE=1`. On any MCU with a single-precision FPU, don't.
+To run in `double` instead of `float`, define `AXXPID_USE_DOUBLE=1`. On any MCU
+with a single-precision FPU, don't.
 
 ---
 
-## The 90% case
+## Units: the mistake everyone makes
 
-```c
-axxpid_t pid;
-
-axxpid_init(&pid, 2.0f, 0.5f, 0.1f, 0.0f, 100.0f);
-```
-
-Three gains and the actuator range. Everything else takes a sensible default:
-direct acting, automatic mode, proportional on error, derivative on
-measurement, conditional-integration anti-windup, no feed-forward.
-
-Then, once per control period:
-
-```c
-float u = axxpid_update(&pid, setpoint, measurement, dt_seconds);
-```
-
-The output limits are arguments rather than a separate call because a
-controller that does not know what its actuator can do cannot protect its
-integrator, and forgetting them is the easiest way to get a badly behaved
-loop. Pass `-AXXPID_UNLIMITED, AXXPID_UNLIMITED` if you genuinely want an
-unbounded output.
-
-`axxpid_init` also never leaves you holding an uninitialised controller. Even
-when it rejects an argument it installs the defaults and zero gains, so code
-that ignores the return value gets a controller that does nothing rather than
-one running on whatever was on the stack.
-
----
-
-## Units, and the mistake everyone makes
-
-AxxPID uses the **parallel** (independent-gain) form:
+AxxPID uses the **parallel** form, where each gain acts on its own term:
 
 ```
 u = kp·e  +  ki·∫e dt  +  kd·de/dt
@@ -178,14 +179,14 @@ so the gains carry units:
 | `ki` | output / (error·second) | Output added per second, per unit of error. |
 | `kd` | output·second / error | Output per unit of error *rate*. |
 
-`ki` and `kd` are **per second**, always, regardless of how fast your loop
-runs. This is where most PID ports go wrong: they fold the sample period into
-the gains, so doubling the loop rate silently doubles the integral action.
-AxxPID integrates against the real elapsed time you pass in, so changing the
-sample rate changes nothing about the tuning.
+**`ki` and `kd` are per second, always** — not per sample, whatever rate your
+loop runs at. This is where most PID ports go wrong: they fold the sample
+period into the gains, so doubling the loop rate silently doubles the integral
+action. AxxPID integrates against the real elapsed time you pass in, so
+changing the sample rate changes nothing about the tuning.
 
-If you think in **standard** (ISA) form instead — proportional gain, integral
-time, derivative time — use:
+If you think in **integral time** and **derivative time** instead — the form
+industrial controllers use — say so:
 
 ```c
 axxpid_set_tunings_standard(&pid, kp, ti_seconds, td_seconds);
@@ -200,9 +201,8 @@ Pass `ti = 0` to turn integral action off.
 
 Two ways to drive the loop.
 
-**You own the clock** — a timer interrupt or an RTOS periodic task. This is
-the better option: a constant period is what every stability margin you tune
-for assumes.
+**You own the clock** — a timer interrupt or an RTOS task. This is the better
+option: a constant period is what every stability margin you tune for assumes.
 
 ```c
 void TIM6_IRQHandler(void) {
@@ -211,8 +211,8 @@ void TIM6_IRQHandler(void) {
 }
 ```
 
-**AxxPID owns the clock** — call it as often as you like from a busy main
-loop and let it rate-limit itself against any millisecond counter:
+**AxxPID owns the clock** — call it as often as you like from a busy main loop
+and let it rate-limit itself against any millisecond counter:
 
 ```c
 axxpid_set_sample_time(&pid, 25, false);   /* recompute every 25 ms */
@@ -228,48 +228,103 @@ while (1) {
 
 `axxpid_update_at` returns `true` only on the calls where the control law
 actually ran, and uses the *measured* interval rather than the nominal one, so
-a late call costs you a little accuracy instead of correctness. The
-subtraction is unsigned, so a 32-bit tick counter wrapping every 49.7 days is
-handled.
+a late call costs a little accuracy instead of correctness. The subtraction is
+unsigned, so a 32-bit tick counter wrapping every 49.7 days is handled.
 
 If the loop can be stopped for a long time — a fault, a menu, a firmware
-update — call `axxpid_reset()` when you resume, or set `axxpid_set_dt_max()`
-so a single enormous `dt` cannot dump a huge step into the integrator.
+update — call `axxpid_reset()` when you resume.
+
+---
+
+## Tuning
+
+If you have never tuned a loop before, do this, in this order:
+
+1. Set `ki = 0` and `kd = 0`. Set the output limits to your real actuator
+   range.
+2. Raise `kp` until the loop oscillates steadily, then halve it.
+3. Raise `ki` until the leftover error is gone within a time you are happy
+   with. Too much `ki` looks like a slow, rolling overshoot.
+4. Add `kd` only if you need it, and turn the
+   [derivative filter](#the-derivative) on before you do. Too much `kd` looks
+   like the actuator buzzing on sensor noise.
+5. If it overshoots only when you *change* the setpoint and is otherwise fine,
+   see [Softening setpoint changes](#softening-setpoint-changes) rather than
+   detuning anything.
+
+Watch the P, I and D terms separately while you do this — see
+[Watching what it does](#watching-what-it-does). It turns tuning from guesswork
+into reading a graph.
+
+If you would rather measure the process than turn knobs, AxxPID can do that:
+see [Autotuning](#autotuning).
+
+**Ziegler–Nichols and the other published rules**, step tests, and the full
+tables are in **[docs/TUNING.md](docs/TUNING.md)**.
+
+---
+
+## Watching what it does
+
+```c
+axxpid_terms_t terms;
+axxpid_get_terms(&pid, &terms);
+
+printf("pv %.1f  P %.1f  I %.1f  D %.1f  FF %.1f  ->  u %.1f\n",
+       terms.measurement, terms.p, terms.i, terms.d, terms.ff, terms.output);
+```
+
+Or one at a time:
+
+```c
+axxpid_get_p_term(&pid);   axxpid_get_error(&pid);
+axxpid_get_i_term(&pid);   axxpid_get_output(&pid);
+axxpid_get_d_term(&pid);   axxpid_is_saturated(&pid);
+axxpid_get_ff_term(&pid);
+```
+
+`P + I + D + FF` is always exactly the output the control law asked for, before
+clamping. Graphing them separately is the fastest way to diagnose a loop:
+
+- A large P swinging back and forth — too much gain.
+- A slow-moving I that will not settle — the integrator cannot let go.
+- A D term that looks like jagged noise — the derivative is amplifying your
+  sensor. Filter it.
+- `axxpid_is_saturated()` true for long stretches — the actuator is undersized,
+  or `kp` is far too high.
 
 ---
 
 ## Feed-forward
 
-Feedback control is reactive: it cannot do anything until an error exists.
-Feed-forward is the opposite — if you already know roughly what output a given
-setpoint needs, apply it immediately and leave the feedback loop to correct
-only what your model got wrong.
+Feedback only acts *after* an error appears. Feed-forward acts first: if you
+already know roughly what output a given setpoint needs, apply it immediately
+and leave the feedback loop to correct only what your guess got wrong.
 
 This is usually the largest single improvement available to a temperature or
 motion loop, and it is almost never in a PID library.
 
-**A constant bias** — the output that holds the process at rest:
+**A constant** — the output that holds the process at rest:
 
 ```c
 axxpid_set_feedforward_bias(&pid, 40.0f);
 ```
 
-**Proportional to the setpoint** — the steady-state inverse of the plant. If
-holding the process at `sp` needs an output of `sp/G`, then:
+**Proportional to the setpoint.** If holding the process at `sp` needs an
+output of `sp/G`:
 
 ```c
 axxpid_set_feedforward_gains(&pid, 1.0f / G, 0.0f);
 ```
 
 **Proportional to how fast the setpoint is moving** — what makes a ramp track
-without lag. For a first-order plant with time constant τ, `rate_gain = τ/G`:
+without lagging behind:
 
 ```c
 axxpid_set_feedforward_gains(&pid, 1.0f / G, tau / G);
 ```
 
-**Anything else** — a lookup table, a polynomial, a gain schedule, a measured
-disturbance, a full inverse plant model:
+**Anything else** — a lookup table, a gain schedule, a measured disturbance:
 
 ```c
 static float holding_power(float setpoint, float measurement, void *user) {
@@ -280,207 +335,120 @@ static float holding_power(float setpoint, float measurement, void *user) {
 axxpid_set_feedforward_fn(&pid, holding_power, NULL);
 ```
 
-All four sum. The result is added **before** the output is clamped and is
-included in the anti-windup calculation, which is the part that matters: if
-the feed-forward alone saturates the actuator, the integrator sees that and
-stops accumulating instead of winding up behind a term it cannot observe.
+All four add together. The result goes in *before* the output is clamped and is
+part of the anti-windup calculation, which is the part that matters: if the
+feed-forward alone saturates the actuator, the integrator sees that and stops
+accumulating instead of winding up behind a term it cannot observe.
 
 Feed-forward does not replace the integrator — it is the integrator's head
 start. Watch `axxpid_get_i_term()` shrink towards zero as your model gets
-better. That is the number that tells you how good your feed-forward is.
+better. That number tells you how good your feed-forward is.
 
-See `examples/02_feedforward.c` for all three side by side.
+`examples/02_feedforward.c` runs three kinds side by side.
 
 ---
 
 ## Anti-windup
 
-When the actuator is at its limit the loop is open, and an integrator that
-keeps accumulating is writing a cheque the process has to pay back as
-overshoot. Three options:
+When the actuator is at its limit, the integral keeps growing but cannot do
+anything about it. Release the limit and all that stored-up integral has to be
+unwound before the output moves, so the process sails past the setpoint. That
+is **windup**, and it is the most common reason a loop overshoots badly.
+
+Three tools, which combine:
 
 ```c
 axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_CONDITIONAL, 0.0f);
 ```
 
 **Conditional integration** (the default). Integration is frozen for a sample
-whenever the step would push an output that is already beyond what the
-actuator can reach further out. Cheap — two comparisons — and it never exceeds
-the limit at all. This is what AxxSolder has run for years. "What the actuator
-can reach" includes the slew rate, if you have set one.
+whenever the step would push an output that is already beyond what the actuator
+can reach further out. Cheap, and it never exceeds the limit at all. This is
+what AxxSolder has run for years.
 
 ```c
 axxpid_set_antiwindup(&pid, AXXPID_ANTIWINDUP_BACK_CALCULATION, tt);
 ```
 
-**Back-calculation.** The integrator is bled continuously towards whatever the
-actuator actually got:
-
-```
-I += (dt/Tt)·(u_limited − u_wanted)
-```
-
-Smoother coming off the limit than a hard freeze, and it accounts for the
-slew-rate limit as well as the output clamp because the *final* output is fed
-back. Start with `Tt = Ti = kp/ki`, or `Tt = √(Ti·Td)` for a full PID.
-
-`dt/Tt` is a feedback gain, so it is capped at 1 internally: a `Tt` that is
-sane for your nominal period would otherwise ring, and then diverge, the first
-time a sample arrived late.
+**Back-calculation.** Each sample the integral is pulled a little way towards
+the value that would have produced the output the actuator actually got.
+Smoother coming off a limit than a hard freeze. Start with `tt` equal to the
+integral time, `kp/ki`.
 
 ```c
 axxpid_set_integral_limits(&pid, -300.0f, 300.0f);
 ```
 
-**An explicit clamp on the integral itself**, independent of both. This is the
-most direct way to bound how much authority the integrator can ever hold, and
-it composes with either strategy above. AxxSolder runs ±300 on a 0–500 output.
+**A hard limit on the integral**, independent of both. The most direct way to
+cap how much the integrator can ever contribute. AxxSolder runs ±300 on a
+0–500 output.
 
-The limits default to unbounded, so integral action works out of the box.
-(A library that defaults them to zero silently disables the I term and then
-you spend an afternoon on it.)
+If you do not set them, `axxpid_init` picks limits ten output spans either side
+of your output range — wide enough never to interfere, but not unbounded.
+Unbounded is dangerous: one wild sensor reading can push the integral so far
+that ordinary steps round away to nothing, and the loop sits at a limit for
+good.
 
 ---
 
 ## The derivative
 
-The D term is differentiated from the **measurement**, not the error. A
-setpoint step is a discontinuity; the measurement is a physical quantity and
-cannot jump. Differentiating the error therefore produces an enormous spike on
-every setpoint change — "derivative kick" — that slams the actuator into its
-limit for a sample. Differentiating the measurement does not.
+The D term is taken from the **measurement**, not the error. A setpoint can
+jump; a physical measurement cannot. Differentiating the error therefore
+produces a huge spike every time you change the setpoint — "derivative kick" —
+that slams the actuator into its limit for a sample. Differentiating the
+measurement does not.
 
-Derivatives amplify noise in direct proportion to frequency, so unless your
-measurement is genuinely clean, filter it:
+Derivatives amplify noise. Unless your measurement is genuinely clean, filter
+it:
 
 ```c
 axxpid_set_derivative_filter(&pid, 10.0f);   /* N, typically 8..16 */
 ```
 
-This is the standard Åström–Hägglund construction: a first-order low-pass with
-`Tf = Td/N = (kd/kp)/N`, which caps the high-frequency gain of the D term at
-`kp·N` instead of letting it grow without bound. Lower `N` filters harder;
-below about 2 there is no derivative action left, above about 20 there is no
-filtering left.
-
-If you retune at run time but the sensor's noise bandwidth does not change,
-pin the filter to a fixed time constant instead:
-
-```c
-axxpid_set_derivative_filter_tau(&pid, 0.05f);   /* seconds */
-```
-
-Filtering is **off by default**, so that `kd` means exactly what the equation
-says and AxxPID reproduces the AxxSolder behaviour bit for bit. Turn it on for
+`N` sets how hard: lower filters more. Below about 2 there is no derivative
+action left; above about 20 there is no filtering left. **This is off by
+default**, so `kd` means exactly what the equation says — but turn it on for
 almost any real sensor.
 
-The filter coefficient is recomputed from the measured `dt` on every sample,
-so loop jitter cannot silently move the corner frequency.
-
----
-
-## Setpoint weighting
-
-Two-degree-of-freedom control, in one line:
-
-```c
-axxpid_set_setpoint_weights(&pid, b, c);
-```
-
-The P term acts on `b·sp − pv` and the D term on `c·sp − pv`.
-
-| `b` | Effect |
-|---|---|
-| `1.0` | Proportional on error. Fastest setpoint tracking, most overshoot. **Default.** |
-| `0.3`–`0.7` | Softer response to a setpoint step, identical disturbance rejection. |
-| `0.0` | Proportional on measurement. No proportional step at all on a setpoint change. |
-
-| `c` | Effect |
-|---|---|
-| `0.0` | Derivative on measurement. **Default, and almost always right.** |
-| `1.0` | Derivative on error. Reintroduces derivative kick; occasionally wanted for aggressive tracking. |
-
-Lowering `b` is the cleanest knob for "it overshoots when I change the
-setpoint, but I don't want to detune the loop", because `b` does not touch the
-disturbance response at all.
-
----
-
-## Manual mode and bumpless transfer
-
-```c
-axxpid_set_mode(&pid, AXXPID_MODE_MANUAL);
-axxpid_set_manual_output(&pid, 35.0f);
-```
-
-In manual mode `axxpid_update` returns your value and continuously
-back-calculates the integrator to match it, so switching back is seamless:
-
-```c
-axxpid_set_mode(&pid, AXXPID_MODE_AUTOMATIC);
-/* The next output continues from 35.0, it does not leap to kp·error. */
-```
-
-Same idea when you are starting up and already know where the actuator is:
-
-```c
-axxpid_reset_to(&pid, 35.0f);
-```
-
-And when you want to retune a live loop without a step in the output:
-
-```c
-axxpid_set_bumpless_tuning(&pid, true);
-axxpid_set_tunings(&pid, new_kp, new_ki, new_kd);
-```
-
-Changing `ki` never causes a step, with or without that flag, because the
-integral is accumulated in output units rather than being stored as a raw
-error sum and scaled at read time. Changing `kp` or `kd` does, unless you ask
-for the compensation.
+The filter coefficient is recomputed from the measured `dt` every sample, so an
+irregular loop period cannot quietly move the cut-off frequency.
 
 ---
 
 ## One-way actuators
 
-A heater can heat but cannot cool. A gravity-fed valve can open but cannot
-suck. Once the process is above the setpoint your only actuator is patience —
-and a controller tuned for how fast it can push will always overshoot, because
-the authority it uses going up has no counterpart coming down.
+A heater can heat but not cool. Once the process is above the setpoint, all the
+controller can do is wait — and a loop tuned for how fast it can push will
+always overshoot, because the authority it uses going up has no counterpart
+coming down.
 
-Two features exist for this, both from AxxSolder.
+Two settings exist for this, both from AxxSolder.
 
-**Asymmetric integral gain.** Drain the integrator faster than it filled:
+**Drain the integrator faster than it filled:**
 
 ```c
 axxpid_set_integral_overshoot(&pid, 7.0f, -1.0f);
 ```
 
-While the error is below `-1.0` — that is, the process has overshot by more
-than 1 unit — the integral gain is multiplied by 7. The threshold is not zero
-on purpose: a small steady-state error should not trip the fast path, or the
-loop hunts around the setpoint.
+While the error is below −1 — the process has overshot by more than one unit —
+the integral gain is multiplied by 7. The threshold is not zero on purpose: a
+small leftover error should not trip the fast path, or the loop ends up slowly
+oscillating around the setpoint.
 
-**Integral engagement band.** Park the integrator while you are still a long
-way below target:
+**Park the integrator while you are still far below target:**
 
 ```c
 axxpid_set_integral_band(&pid, 75.0f);
 ```
 
-While the process is more than 75 units below the setpoint the integrator is
-held at zero. During a cold start the actuator is flat out regardless, so
-anything the integrator accumulates there is pure debt.
+While the process is more than 75 units below the setpoint the integral is held
+at zero. During a cold start the actuator is flat out regardless, so anything
+the integrator collects there only comes back as overshoot later.
 
-The band is deliberately **one-sided**. A symmetric version would also dump
-the integral when the process is far *above* setpoint, which is exactly when a
-one-way actuator needs the negative integral it has built up.
-
-Note that on a loop where `kp·error` already saturates the output during the
-whole approach, conditional anti-windup blocks the integrator anyway and the
-band changes nothing. It earns its place when `kp` is low enough that the
-output is *not* saturated but the error is still far too large for the
-integrator to have anything useful to say. Measure before reaching for it.
+This one is deliberately **one-sided**. A symmetric version would also dump the
+integral when the process is far *above* setpoint, which is exactly when a
+one-way actuator needs it.
 
 **And the off switch:**
 
@@ -489,9 +457,10 @@ axxpid_set_integral_reset_on_zero_setpoint(&pid, true);
 ```
 
 When a setpoint of exactly zero means "off" in your state machine, this makes
-the controller let go completely so it restarts from a clean state.
+the controller let go completely so it restarts clean.
 
-`examples/04_soldering_iron.c` runs all of these on a two-node thermal model.
+`examples/04_soldering_iron.c` runs all of these on a two-node thermal model
+and measures what each one is worth.
 
 ---
 
@@ -503,8 +472,8 @@ the controller let go completely so it restarts from a clean state.
 axxpid_set_output_slew_rate(&pid, 50.0f);   /* output units per second */
 ```
 
-Applied after the output clamp, and the slew-limited value is what
-back-calculation feeds back — so a rate limit unwinds the integrator too.
+Both anti-windup strategies account for it, so the integrator is held back
+while the output is rate-limited.
 
 **A deadband**, to stop sensor noise driving an actuator back and forth:
 
@@ -512,125 +481,75 @@ back-calculation feeds back — so a rate limit unwinds the integrator too.
 axxpid_set_deadband(&pid, 0.5f);
 ```
 
-Errors smaller than this produce no P or I action. Larger errors are *shifted*
-towards zero by the deadband width rather than passed through unchanged, so
-the control signal stays continuous across the band edge instead of stepping.
-The D term keeps acting on the raw measurement, so real disturbances are still
-caught.
+Errors smaller than this leave the controller acting as though the measurement
+were exactly on setpoint. Larger errors are *shifted* towards zero by the
+deadband width rather than passed through unchanged, so the control signal
+stays continuous across the edge instead of stepping.
 
 ---
 
-## Reverse-acting processes
-
-When raising the output *lowers* the measurement — a cooler, a drain valve, a
-brake:
+## Manual mode
 
 ```c
-axxpid_set_acting(&pid, AXXPID_ACTING_REVERSE);
+axxpid_set_mode(&pid, AXXPID_MODE_MANUAL);   /* holds the current output */
+axxpid_set_manual_output(&pid, 35.0f);       /* or command a specific one */
 ```
 
-The control error is negated internally. The gains stay positive and
-`axxpid_get_kp()` returns exactly what you set, rather than a sign-flipped
-copy you then have to reason about. Changing the sense clears the integrator,
-because the accumulated value belongs to the old wiring.
+In manual mode `axxpid_update` returns your value and keeps the integral
+matched to it, so switching back is seamless:
+
+```c
+axxpid_set_mode(&pid, AXXPID_MODE_AUTOMATIC);
+/* continues from 35.0 — it does not leap to kp·error */
+```
+
+Same idea when starting up and you already know where the actuator is:
+
+```c
+axxpid_reset_to(&pid, 35.0f);
+```
+
+And to retune a running loop without a step in the output:
+
+```c
+axxpid_set_bumpless_tuning(&pid, true);
+axxpid_set_tunings(&pid, new_kp, new_ki, new_kd);
+```
+
+Changing `ki` never causes a step, with or without that flag, because the
+integral is accumulated in output units rather than stored as a raw error sum
+and scaled at read time.
 
 ---
 
-## Watching what it does
+## Softening setpoint changes
+
+If the loop is well behaved against disturbances but overshoots whenever you
+*change* the setpoint, the cleanest fix is not to detune it:
 
 ```c
-axxpid_terms_t terms;
-axxpid_get_terms(&pid, &terms);
-
-printf("P %.1f  I %.1f  D %.1f  FF %.1f  ->  u %.1f\n",
-       terms.p, terms.i, terms.d, terms.ff, terms.output);
+axxpid_set_setpoint_weights(&pid, 0.5f, 0.0f);
 ```
 
-Or one at a time — the direct equivalents of AxxSolder's `PID_GetPpart`,
-`PID_GetIpart` and `PID_GetDpart`:
+The first number scales how much of a setpoint change the proportional term
+sees. `1.0` is the default and reacts fully; `0.0` ignores setpoint changes
+entirely and responds only to the measurement; in between trades tracking speed
+for overshoot. It does not touch how the loop rejects disturbances at all,
+which is why it is the right knob for this job.
 
-```c
-axxpid_get_p_term(&pid);
-axxpid_get_i_term(&pid);
-axxpid_get_d_term(&pid);
-axxpid_get_ff_term(&pid);
-axxpid_get_error(&pid);
-axxpid_get_output(&pid);
-axxpid_is_saturated(&pid);
-```
-
-`axxpid_get_i_term()` is the snapshot that went into the last output, which is
-what you want beside it on a graph. `axxpid_get_integral()` is the live
-integrator — pair it with `axxpid_set_integral()` to save and restore the
-controller across a power cycle.
-
-The four terms always sum to the pre-clamp output. Graphing them separately is
-the fastest way to diagnose a loop: an oscillation with a large swinging P is
-too much gain, one with a slow-moving I is an integrator that cannot let go,
-and a D term that looks like grass is the derivative amplifying noise.
-
-`axxpid_is_saturated()` sitting true for long stretches means the actuator is
-undersized for what you are asking, or `kp` is far too high.
-
----
-
-## Tuning
-
-**By hand**, the order that works:
-
-1. Set `ki = 0`, `kd = 0`. Set the output limits.
-2. Raise `kp` until the loop oscillates steadily, then halve it.
-3. Raise `ki` until the steady-state error is gone within an acceptable time.
-   Too much `ki` shows up as a slow, rolling overshoot.
-4. Add `kd` only if you need it. Turn the derivative filter on before you do.
-   Too much `kd` shows up as the actuator buzzing on sensor noise.
-5. If it overshoots only on setpoint changes and is otherwise fine, lower `b`
-   rather than detuning anything.
-
-**From an oscillation test.** Raise `kp` until the loop sustains a constant
-oscillation, note that gain as `Ku` and the period as `Tu`, then:
-
-```c
-axxpid_gains_t g = axxpid_tune_from_ultimate(AXXPID_RULE_TYREUS_LUYBEN_PID,
-                                             ku, tu);
-axxpid_tune_apply(&pid, &g);
-```
-
-| Rule | `kp` | `Ti` | `Td` | Character |
-|---|---|---|---|---|
-| `AXXPID_RULE_ZN_P` | 0.5·Ku | — | — | Proportional only |
-| `AXXPID_RULE_ZN_PI` | 0.45·Ku | Tu/1.2 | — | No derivative needed |
-| `AXXPID_RULE_ZN_PID` | 0.6·Ku | Tu/2 | Tu/8 | Classic, ~25% overshoot |
-| `AXXPID_RULE_PESSEN` | 0.7·Ku | Tu/2.5 | 0.15·Tu | Fastest, most overshoot |
-| `AXXPID_RULE_SOME_OVERSHOOT` | Ku/3 | Tu/2 | Tu/3 | Gentler |
-| `AXXPID_RULE_NO_OVERSHOOT` | 0.2·Ku | Tu/2 | Tu/3 | When overshoot is unacceptable |
-| `AXXPID_RULE_TYREUS_LUYBEN_PI` | Ku/3.2 | 2.2·Tu | — | Robust, noisy loops |
-| `AXXPID_RULE_TYREUS_LUYBEN_PID` | Ku/2.2 | 2.2·Tu | Tu/6.3 | **A good default** |
-
-Ziegler–Nichols is famous, not gentle. Start at Tyreus–Luyben and tighten only
-if you need to.
-
-**From a step test.** Step the output in open loop, read the process gain `K`,
-the apparent dead time `L` and the time constant `T` off the response curve:
-
-```c
-axxpid_tune_ziegler_nichols_open(k, l, t);  /* aggressive */
-axxpid_tune_cohen_coon(k, l, t);            /* better when L/T > 0.3 */
-axxpid_tune_lambda(k, l, t, lambda);        /* you pick the closed-loop speed */
-```
-
-Lambda/SIMC is the one to reach for in production, because `λ` *is* the
-closed-loop time constant: `λ = L` is aggressive, `λ = 3L` is a robust
-default, larger is calmer. It is the only rule here where the knob means
-something physical.
+(The second number does the same for the derivative term. Leave it at `0`.)
 
 ---
 
 ## Autotuning
 
-Relay feedback: drive the process with a bang-bang output around the operating
-point, measure the limit cycle it provokes, and recover `Ku` and `Tu` from the
-describing function `Ku = 4d/(π√(a²−h²))`.
+AxxPID can measure your process and pick gains for you. It drives the output
+hard one way and then the other to make the process swing, measures how big and
+how fast the swing is, and works the gains out from that.
+
+> **This deliberately makes your process oscillate.** Only run it on a plant
+> that can safely swing about the operating point, and size `output_step` for
+> an excursion your hardware can live with.
 
 ```c
 #include "axxpid/axxpid_tune.h"
@@ -641,319 +560,90 @@ axxpid_relay_config_t cfg;
 axxpid_relay_config_default(&cfg);
 cfg.setpoint    = 250.0f;   /* tune at the temperature you actually run at */
 cfg.output_bias = 100.0f;   /* roughly the power that holds it there       */
-cfg.output_step = 30.0f;    /* the relay swings ±30 around that            */
+cfg.output_step = 30.0f;    /* it will swing ±30 around that               */
 cfg.hysteresis  = 1.0f;     /* just above your measurement noise           */
-cfg.cycles      = 4;
-cfg.settle_cycles = 2;      /* discard the first two, they are transient   */
-cfg.timeout     = 600.0f;
 
 axxpid_relay_init(&relay, &cfg);
 
-float u, ku, tu;
+float u;
 while (axxpid_relay_update(&relay, read_sensor(), dt, &u)
            == AXXPID_RELAY_RUNNING) {
     set_actuator(u);
     wait_one_period();
 }
 
-if (axxpid_relay_result(&relay, &ku, &tu) == AXXPID_OK) {
+if (axxpid_relay_result(&relay, NULL, NULL) == AXXPID_OK) {
     axxpid_gains_t g = axxpid_relay_gains(&relay,
                                           AXXPID_RULE_TYREUS_LUYBEN_PID);
     axxpid_tune_apply(&pid, &g);
 }
 ```
 
-> **An autotune makes your process oscillate on purpose.** Only run it on a
-> plant that can safely swing about the operating point, and size
-> `output_step` for an excursion your hardware can live with.
+**Always check the state it returns.** `AXXPID_RELAY_TIMEOUT` means no usable
+oscillation appeared — usually `output_bias` is wrong, so the process never
+crossed the setpoint. `AXXPID_RELAY_FAILED` means the swing was too small to
+measure. Neither produces gains.
 
-Practical notes:
+Gains are local: a tip tuned at 200 °C is not tuned for 400 °C. Tune where you
+run.
 
-- **Tune where you run.** Plants are not linear; gains are local. A tip tuned
-  at 200 °C is not tuned for 400 °C.
-- **Get `output_bias` right.** It should be roughly the output that actually
-  holds the process at your setpoint — read it off a manual-mode run. An
-  off-centre bias makes the oscillation lopsided and stretches `Tu` (about
-  +20% for a bias one relay-amplitude off). If the true holding output falls
-  outside `bias ± output_step`, the relay never switches at all and you get
-  `AXXPID_RELAY_TIMEOUT` with the actuator pinned.
-- **Keep the hysteresis small** — around a tenth of the amplitude it provokes.
-  It exists to stop the relay chattering on noise, and it is not free: the
-  `√(a²−h²)` term corrects the shifted switching point, worth under one per
-  cent, but what hysteresis mainly does is move the oscillation off the
-  ultimate frequency, and *that* is not corrected. At `h/a ≈ 0.1` expect `Tu`
-  about 10% high; at 0.2, about 20%.
-- **Check the state; never assume it finished.** `AXXPID_RELAY_TIMEOUT` means
-  no usable limit cycle appeared — either it never crossed the setpoint, or
-  every apparent cycle was too short to be real. `AXXPID_RELAY_FAILED` means
-  the oscillation was smaller than twice the hysteresis, where the estimate
-  stops meaning anything. Neither produces gains.
-- **Noise cannot fake a result.** A relay flipping every sample or two is
-  following the sensor, not the process, and would otherwise report a tiny
-  `Tu` and an enormous `Ku`. Cycles shorter than
-  `AXXPID_RELAY_MIN_SAMPLES_PER_CYCLE` (8) are discarded, so a noisy autotune
-  times out rather than handing you gains that would wreck the plant.
-- The describing function is a first-harmonic approximation. Expect `Tu`
-  within a few per cent and `Ku` perhaps 20% low on a lag-dominant process.
-  That is fine — you are feeding it into rules with a safety factor built in,
-  and `Ku` biased low gives gains biased gentle.
-
-Full worked example in `examples/03_autotune.c`.
-
----
-
-## The control law in full
-
-Every sample, with `dir` = +1 direct or −1 reverse:
-
-```
-e       = dir·(sp − pv)                     clamped through the deadband
-P       = kp·(e − dir·(1−b)·sp)             ≡ kp·dir·(b·sp − pv)
-d_raw   = Δ[dir·(c·sp − pv)] / dt
-d_filt += (dt/(Tf+dt))·(d_raw − d_filt)     Tf = (kd/kp)/N, or 0 for none
-D       = kd·d_filt
-FF      = bias + kf·sp + kf_rate·Δsp/dt + ff_fn(sp, pv)
-
-ki_eff  = (e < threshold) ? ki·over_gain : ki
-ΔI      = ki_eff·e·dt                       skipped if it deepens saturation
-I       = clamp(I + ΔI, i_min, i_max)
-I       = 0                                 if e > band, or sp == 0 and enabled
-
-u_raw   = P + I + D + FF
-u       = clamp(u_raw, out_min, out_max)
-u       = clamp(u, u_prev − rate·dt, u_prev + rate·dt)
-I      += (dt/Tt)·(u − u_raw)               back-calculation only
-```
-
-The first update after a reset produces `D = 0` and no velocity feed-forward,
-because there is no history to differentiate against.
-
-A non-finite setpoint, measurement or `dt`, or a `dt ≤ 0`, returns the
-previous output and changes nothing — one bad ADC read cannot poison the
-integrator.
-
----
-
-## API reference
-
-### Lifecycle
-
-| Function | Purpose |
-|---|---|
-| `axxpid_init(pid, kp, ki, kd, out_min, out_max)` | Initialise with these gains and actuator range. |
-| `axxpid_config_default(cfg)` | Fill a config struct with the defaults. |
-| `axxpid_init_config(pid, cfg)` | Initialise from a fully specified config. |
-| `axxpid_reset(pid)` | Clear all state, keep the configuration. |
-| `axxpid_reset_to(pid, output)` | Clear state and resume from a known output. |
-
-### Execution
-
-| Function | Purpose |
-|---|---|
-| `axxpid_update(pid, sp, pv, dt)` | Run one update. Returns the output. |
-| `axxpid_update_at(pid, sp, pv, now_ms)` | Rate-limited update on a ms clock. Returns whether it ran. |
-
-### Tuning
-
-| Function | Purpose |
-|---|---|
-| `axxpid_set_tunings(pid, kp, ki, kd)` | Parallel form. |
-| `axxpid_set_tunings_standard(pid, kp, ti, td)` | Standard/ISA form. |
-| `axxpid_set_kp/ki/kd(pid, value)` | One gain at a time. |
-
-### Configuration
-
-| Function | Purpose |
-|---|---|
-| `axxpid_set_output_limits(pid, min, max)` | Actuator range. |
-| `axxpid_set_output_slew_rate(pid, rate)` | Maximum change per second. |
-| `axxpid_set_integral(pid, value)` | Set the integral term directly. |
-| `axxpid_set_integral_limits(pid, min, max)` | Clamp on the integral term. |
-| `axxpid_set_antiwindup(pid, mode, tt)` | Conditional, back-calculation, or none. |
-| `axxpid_set_integral_band(pid, band)` | Park the integrator when far below setpoint. |
-| `axxpid_set_integral_overshoot(pid, gain, threshold)` | Extra integral gain after overshoot. |
-| `axxpid_set_integral_reset_on_zero_setpoint(pid, on)` | Zero setpoint means off. |
-| `axxpid_set_derivative_filter(pid, n)` | Derivative filter by divisor N. |
-| `axxpid_set_derivative_filter_tau(pid, tau)` | Derivative filter by time constant. |
-| `axxpid_set_setpoint_weights(pid, b, c)` | Two-degree-of-freedom weights. |
-| `axxpid_set_deadband(pid, deadband)` | Ignore small errors. |
-| `axxpid_set_feedforward_bias(pid, bias)` | Constant feed-forward. |
-| `axxpid_set_feedforward_gains(pid, k_sp, k_rate)` | Setpoint and setpoint-rate feed-forward. |
-| `axxpid_set_feedforward_fn(pid, fn, user)` | Arbitrary feed-forward hook. |
-| `axxpid_set_acting(pid, acting)` | Direct or reverse. |
-| `axxpid_set_mode(pid, mode)` | Manual or automatic. |
-| `axxpid_set_manual_output(pid, u)` | The value manual mode returns. |
-| `axxpid_set_sample_time(pid, ms, every_call)` | Rate limit for `axxpid_update_at`. |
-| `axxpid_set_dt_max(pid, seconds)` | Cap `dt` after a stall. |
-| `axxpid_set_bumpless_tuning(pid, on)` | Compensate the integrator when retuning. |
-
-Every setter returns `AXXPID_OK`, `AXXPID_ERR_NULL` or `AXXPID_ERR_PARAM`, and
-a rejected call changes nothing.
-
-### Getters
-
-| Function | Purpose |
-|---|---|
-| `axxpid_get_terms(pid, terms)` | P, I, D, FF, output, error, setpoint and measurement in one struct. |
-| `axxpid_get_p_term/i_term/d_term/ff_term(pid)` | One contribution to the last output. |
-| `axxpid_get_integral(pid)` | The live integrator, for persistence. |
-| `axxpid_get_output(pid)` / `axxpid_get_error(pid)` | Latest output / error. |
-| `axxpid_is_saturated(pid)` | Was the last output limited. |
-| `axxpid_get_kp/ki/kd(pid)` | The gains, exactly as set. |
-| `axxpid_get_mode/acting(pid)` | Current mode / sense. |
-| `axxpid_version()` | Version string. |
-
-### Tuning module (`axxpid_tune.h`)
-
-| Function | Purpose |
-|---|---|
-| `axxpid_gains_from_standard/parallel(...)` | Build a gain set in either form. |
-| `axxpid_tune_apply(pid, gains)` | Load a gain set into a controller. |
-| `axxpid_tune_from_ultimate(rule, ku, tu)` | Apply a published rule table. |
-| `axxpid_tune_ziegler_nichols_open(k, l, t)` | From a step test. |
-| `axxpid_tune_cohen_coon(k, l, t)` | From a step test, dead-time dominant. |
-| `axxpid_tune_lambda(k, l, t, lambda)` | Lambda / SIMC, you pick the speed. |
-| `axxpid_relay_config_default(cfg)` | Relay defaults. |
-| `axxpid_relay_init(relay, cfg)` | Start an autotune. |
-| `axxpid_relay_update(relay, pv, dt, &u)` | Advance it one sample. |
-| `axxpid_relay_result(relay, &ku, &tu)` | Read the measurement. |
-| `axxpid_relay_gains(relay, rule)` | Straight from autotune to gains. |
-
----
-
-## Configuration reference
-
-Every field of `axxpid_config_t`, with its default.
-
-| Field | Default | Notes |
-|---|---|---|
-| `kp`, `ki`, `kd` | `0` | Parallel form. Must be ≥ 0; use `acting` for reverse. |
-| `acting` | `DIRECT` | Raising the output raises the measurement. |
-| `mode` | `AUTOMATIC` | |
-| `out_min`, `out_max` | ±`AXXPID_UNLIMITED` | Arguments to `axxpid_init`. |
-| `out_slew_rate` | `0` | Disabled. Output units per second. |
-| `integral_min`, `integral_max` | ±`AXXPID_UNLIMITED` | Clamp on the I term. |
-| `antiwindup` | `CONDITIONAL` | |
-| `tracking_time` | `1.0` | `Tt`, back-calculation only. |
-| `integral_band` | `AXXPID_UNLIMITED` | Disabled. One-sided. |
-| `integral_overshoot_gain` | `1.0` | Symmetric, i.e. disabled. |
-| `integral_overshoot_threshold` | `0.0` | Error below which the extra gain applies. |
-| `integral_reset_on_zero_setpoint` | `false` | |
-| `derivative_filter_n` | `0` | Unfiltered. Set 8–16 for a real sensor. |
-| `derivative_filter_tau` | `0` | Overrides `n` when > 0. |
-| `setpoint_weight_b` | `1.0` | Proportional on error. |
-| `setpoint_weight_c` | `0.0` | Derivative on measurement. |
-| `deadband` | `0` | Disabled. |
-| `ff_bias` | `0` | |
-| `ff_setpoint_gain` | `0` | |
-| `ff_setpoint_rate_gain` | `0` | |
-| `ff_fn`, `ff_user` | `NULL` | |
-| `sample_time_ms` | `10` | `axxpid_update_at` only. |
-| `update_every_call` | `false` | |
-| `dt_max` | `AXXPID_UNLIMITED` | Disabled. |
-| `bumpless_tuning` | `false` | |
+Every rule, the practical notes and the maths are in
+**[docs/TUNING.md](docs/TUNING.md)**. Worked example in
+`examples/03_autotune.c`.
 
 ---
 
 ## Limitations and gotchas
 
 - **`ki` and `kd` are per second, not per sample.** If you are porting gains
-  from a library that folded the sample period in, they will need scaling.
-- **The derivative filter is off by default.** `kd` therefore means exactly
-  what the equation says, and on a noisy sensor that is not what you want.
-  Turn it on.
+  from a library that folded the sample period in, they need scaling.
+- **The derivative filter is off by default.** On a noisy sensor that is not
+  what you want. Turn it on.
 - **Not interrupt-safe by itself.** A controller is a plain struct with no
   locking. Call `axxpid_update` from one context. If you read the terms from
-  another, either accept a torn read or guard it — the library will not do it
-  behind your back.
+  another, guard it yourself.
 - **`-ffast-math` disables the NaN guard.** It tells the compiler NaNs cannot
-  occur, so the check gets deleted. Do not use it if you rely on that
-  protection.
+  occur, so the check is deleted. Do not use it if you rely on that protection.
 - **A long stall still needs your help.** The controller cannot know the loop
   was paused. Call `axxpid_reset()` on resume, or set `axxpid_set_dt_max()`.
-  When `dt_max` does cap a sample, the derivative and velocity feed-forward
-  restart rather than differentiate across the gap — the integral still takes
-  a capped step, so a stall is attenuated, not erased.
-- **Manual→automatic transfer is bumpless unless something else outranks it.**
-  The integral limits, the integral engagement band and the zero-setpoint
-  reset all exist to stop the integrator holding a value, and all three beat
-  the transfer. If you use them, expect a step.
-- **A long-lived `float` integrator stops absorbing tiny steps.** Once the
-  integral is large, a `ki·e·dt` smaller than its last bit rounds away and
-  leaves a small permanent offset. On a slow loop with small gains, build with
-  `AXXPID_USE_DOUBLE=1`.
 - **A wildly wrong sensor reading still costs you a transient.** NaN and
-  infinity are rejected outright, and no single sample can move the integral
-  by more than ten times the output range, so one bad reading can no longer
-  leave the controller stuck for good. It can still leave the integral far
-  enough out to take tens of seconds to unwind. Range-check your sensor; the
-  controller cannot know what "plausible" means for your process.
-- **There is no lower bound on `dt`.** `axxpid_update_at` cannot go below 1 ms,
-  but a direct `axxpid_update` call with a microsecond `dt` will amplify the
-  derivative accordingly. Pass the real elapsed time.
-- **The autotuner deliberately oscillates the process.** See the warning
-  above, and check the returned state rather than assuming it succeeded.
-- **Gains are local.** Autotune and tune at the operating point you actually
-  run at.
-- **`float` by default.** Fine on a Cortex-M4F/M7/M33. On an FPU-less part at
-  a high loop rate, budget for soft-float — or reduce the rate, which a
-  thermal loop will not notice.
+  infinity are rejected outright, and no single sample can move the integral by
+  more than ten times the output range, so one bad reading can no longer leave
+  the controller stuck for good. It can still leave the integral far enough out
+  to take tens of seconds to unwind. Range-check your sensor; the controller
+  cannot know what "plausible" means for your process.
+- **Manual → automatic is bumpless unless something outranks it.** The integral
+  limits, the integral band and the zero-setpoint reset all exist to stop the
+  integrator holding a value, and all three win. If you use them, expect a step.
+- **A long-lived `float` integrator stops absorbing tiny steps.** Once the
+  integral is large, a `ki·e·dt` smaller than its last bit rounds away. On a
+  slow loop with small gains, build with `AXXPID_USE_DOUBLE=1`.
+- **The autotuner deliberately oscillates the process**, and you must check the
+  state it returns rather than assume it succeeded.
 
 ---
 
-## Building and testing
+## More documentation
 
-```bash
-cmake -B build -DAXXPID_STRICT=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-Four suites:
-
-| Suite | Covers |
+| | |
 |---|---|
-| `test_core` | Lifecycle, argument validation, NULL safety on every entry point, NaN/Inf rejection, tick wraparound, scheduling. |
-| `test_features` | One test per control-law feature, checked against hand-derived arithmetic, plus a regression for every defect found in review. |
-| `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, the AxxSolder profile. |
-| `test_tune` | Rule tables against the published coefficients; the relay autotuner against a plant whose true `Ku` and `Tu` are computed numerically in the test. |
+| [docs/TUNING.md](docs/TUNING.md) | Every tuning rule, step tests, autotuner detail. |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config field and every function, as tables. |
+| [docs/CONTROL_LAW.md](docs/CONTROL_LAW.md) | The exact equations and the order they run in. |
+| [docs/BUILDING.md](docs/BUILDING.md) | Building, the test suite, mutation testing, CI. |
+| [docs/PORTING_AXXSOLDER.md](docs/PORTING_AXXSOLDER.md) | Moving from the original AxxSolder PID. |
+| `include/axxpid/axxpid.h` | The authoritative reference — every function documented where it is declared. |
 
-808 assertions in total, in both `float` and `double`. Expected values are
-derived from the difference equations above or from the published tuning
-tables, not recorded from a previous run, so they catch a change in behaviour
-rather than merely pinning it.
+Examples, in the order worth reading them:
 
-They are also checked by mutation testing: twenty deliberately broken copies
-of the library — an inverted filter constant, a dropped anti-windup condition,
-a missing sign — are built and run against the suite. Nineteen are caught. The
-one that is not changes a square root by 0.04%, which is far below anything
-that matters here. A test suite that no broken version can fail is not a test
-suite, and counting assertions does not tell you which you have.
-
-CI builds with GCC and Clang on Linux, macOS and Windows, in both `float` and
-`double`, against C99, C11 and C17, from C++, and cross-compiles for Cortex-M4F
-and Cortex-M0+ with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion
--Wdouble-promotion -Werror`.
-
-Examples build with the tests and run standalone:
-
-```bash
-./build/01_minimal          # a PI loop on a tank
-./build/02_feedforward      # three kinds of feed-forward, side by side
-./build/03_autotune         # relay autotune, then control with the result
-./build/04_soldering_iron   # the AxxSolder configuration, explained
-```
-
----
-
-## Porting from the AxxSolder PID
-
-The algorithm is the same and your gains carry over unchanged. The plumbing is
-not: the old controller held pointers to your variables and called
-`HAL_GetTick()` itself, where AxxPID takes values and returns the output.
-
-Full mapping table, behavioural differences and the two defects fixed along
-the way: **[docs/PORTING_AXXSOLDER.md](docs/PORTING_AXXSOLDER.md)**.
+| | |
+|---|---|
+| `examples/01_minimal.c` | A PI loop on a simulated tank. Start here. |
+| `examples/02_feedforward.c` | Three kinds of feed-forward, side by side. |
+| `examples/03_autotune.c` | Autotune, then control with the result. |
+| `examples/04_soldering_iron.c` | The AxxSolder configuration, explained and measured. |
+| `examples/stm32_hal_snippet.c` | Both timing patterns in a CubeIDE project. |
+| `examples/arduino/` | An Arduino thermostat sketch. |
 
 ---
 

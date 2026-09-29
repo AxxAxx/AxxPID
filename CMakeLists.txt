@@ -95,10 +95,27 @@ if(AXXPID_BUILD_EXAMPLES)
         list(APPEND AXXPID_EXAMPLES 03_autotune)
     endif()
 
+    # Examples are teaching material, so they are built without -Wconversion
+    # and -Wdouble-promotion. Satisfying those means a (double) cast on every
+    # printf argument, which buries the three lines a reader came for.
+    if(MSVC)
+        set(AXXPID_EXAMPLE_WARNINGS /W4)
+    else()
+        set(AXXPID_EXAMPLE_WARNINGS -Wall -Wextra -Wpedantic -Wshadow)
+    endif()
+    if(AXXPID_STRICT)
+        if(MSVC)
+            list(APPEND AXXPID_EXAMPLE_WARNINGS /WX)
+        else()
+            list(APPEND AXXPID_EXAMPLE_WARNINGS -Werror)
+        endif()
+    endif()
+
     foreach(example_name IN LISTS AXXPID_EXAMPLES)
         add_executable(${example_name} examples/${example_name}.c)
         target_link_libraries(${example_name} PRIVATE axxpid)
-        target_compile_options(${example_name} PRIVATE ${AXXPID_WARNINGS})
+        target_compile_options(${example_name} PRIVATE
+                               ${AXXPID_EXAMPLE_WARNINGS})
     endforeach()
 endif()
 

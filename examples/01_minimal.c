@@ -1,9 +1,8 @@
-/**
- * @file  01_minimal.c
- * @brief The smallest useful AxxPID program: a PI loop on a simulated tank.
+/*
+ * 01_minimal.c - the smallest useful AxxPID program.
  *
- * Build and run it on your desktop to see what the controller does before you
- * put it on hardware:
+ * A PI loop filling a simulated tank. Build and run it on your desktop to
+ * watch a loop settle before you put anything on hardware:
  *
  *     cc -Iinclude src/axxpid.c examples/01_minimal.c -o minimal && ./minimal
  */
@@ -12,42 +11,43 @@
 
 #include "axxpid/axxpid.h"
 
-/* Control period. On real hardware this is your timer interrupt rate. */
-#define DT 0.05f
+#define DT 0.05f /* Seconds per step. On hardware, your timer rate. */
+
+/* Stand-in for the real world: a tank that fills through the valve and drains
+ * in proportion to how full it is. Replace with your own process. */
+static float tank_step(float level, float valve)
+{
+    return level + DT * (0.1f * valve - 0.08f * level);
+}
 
 int main(void)
 {
     axxpid_t pid;
-    float level = 0.0f;   /* Process value: tank level, 0..100 %. */
-    float setpoint = 70.0f;
+    float level = 0.0f;     /* What the sensor reads: tank level, 0..100 %. */
+    float setpoint = 70.0f; /* What we want it to be.                       */
     int step;
 
-    /* Three gains and the actuator range is all most loops ever need. */
+    /*          kp    ki    kd     min     max  */
     axxpid_init(&pid, 2.0f, 0.8f, 0.0f, 0.0f, 100.0f);
 
-    (void)printf("  time    level   output\n");
+    printf("  time    level   valve\n");
 
     for (step = 0; step < 700; ++step) {
-        /* --- this is the whole integration --------------------------- */
-        const float valve = axxpid_update(&pid, setpoint, level, DT);
-        /* ------------------------------------------------------------- */
+        /* ---- the whole integration ---- */
+        float valve = axxpid_update(&pid, setpoint, level, DT);
+        /* ------------------------------- */
 
-        /* Stand-in for the real world: a tank that fills through the valve
-         * and drains in proportion to how full it is. */
-        level += DT * (0.1f * valve - 0.08f * level);
+        level = tank_step(level, valve);
 
-        if ((step % 50) == 0) {
-            (void)printf("%6.2f s %7.2f %8.2f\n", (double)((float)step * DT),
-                         (double)level, (double)valve);
+        if (step % 50 == 0) {
+            printf("%6.2f s %7.2f %7.2f\n", step * DT, level, valve);
         }
 
-        /* Halfway through, ask for less. */
         if (step == 200) {
-            setpoint = 40.0f;
+            setpoint = 40.0f; /* Halfway through, ask for less. */
         }
     }
 
-    (void)printf("\nfinal level %.2f %% (setpoint %.2f %%)\n", (double)level,
-                 (double)setpoint);
+    printf("\nfinal level %.2f %%, setpoint %.2f %%\n", level, setpoint);
     return 0;
 }
