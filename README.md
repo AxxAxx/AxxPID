@@ -115,17 +115,42 @@ No dynamic allocation, no globals, no vendor HAL, not even `<math.h>`. Every
 controller lives in a struct you allocate yourself, so you can have as many as
 you like — on the stack, in `.bss`, or inside another struct.
 
-Measured with `arm-none-eabi-gcc -Os`, **192 bytes of RAM** per controller and
-no heap at all:
+Measured with `-Os`, **192 bytes of RAM** per controller and no heap at all:
 
 | Target | Controller | + autotuner |
 |---|---|---|
 | Cortex-M4F (hard float) | 4.4 kB | 2.3 kB |
 | Cortex-M0+ (soft float) | 4.7 kB | 2.7 kB |
+| RISC-V rv32imc (no FPU) | 6.3 kB | 4.2 kB |
 
 It is the control loop from the
 [AxxSolder](https://github.com/AxelJohanssonSWE/AxxSolder) soldering station,
 pulled out and generalised.
+
+### Will it run on my chip?
+
+Almost certainly. This is plain C99 with no vendor headers, no operating
+system, no allocation and no assumptions about word size or endianness — no
+bit shifts, no unions, no pointer punning. If you have a C99 compiler and
+enough RAM for a 192-byte struct, you can run it.
+
+Compiled clean, freestanding, at `-Wall -Wextra -Wpedantic`:
+
+| | |
+|---|---|
+| **ARM** | Cortex-M0+, Cortex-M4F, AArch64 |
+| **RISC-V** | rv32imc, rv64 |
+| **8- and 16-bit** | AVR, MSP430 |
+| **Other** | MIPS, PowerPC, WebAssembly |
+| **Desktop** | x86 and x86-64 on Linux, macOS and Windows, GCC and Clang |
+
+The tests themselves run on the host, so you can develop and tune against a
+simulated process before touching hardware.
+
+One caveat for small parts: the maths is `float`. On anything with a
+single-precision FPU that is free. On an 8-bit AVR it is software floating
+point — it works, and a thermal loop at 10 Hz will not notice, but a fast
+motor loop will.
 
 ---
 

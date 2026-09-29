@@ -2,7 +2,7 @@
   "name": "AxxPID",
   "version": "1.0.0",
   "description": "Portable, dependency-free PID controller for C. Feed-forward, two-degree-of-freedom setpoint weighting, filtered derivative, selectable anti-windup, bumpless transfer, slew limiting, and a relay autotuner. Extracted from the AxxSolder soldering station firmware.",
-  "keywords": ["pid", "control", "controller", "feedforward", "autotune", "pid-controller", "temperature", "motor", "embedded"],
+  "keywords": ["pid", "control", "controller", "feedforward", "autotune", "pid-controller", "temperature", "motor", "embedded", "c99", "arm", "riscv", "avr", "stm32", "arduino", "esp32", "portable"],
   "license": "MIT",
   "authors": [
     {
