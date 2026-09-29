@@ -92,16 +92,26 @@ jobs:
       - name: Report code size
         run: arm-none-eabi-size -t axxpid.o axxpid_tune.o
 
-      # The only external symbol either object may need is memcpy, which the
-      # compiler emits for a struct copy. Anything else means a dependency
-      # has crept in.
+      # On a freestanding build the only external symbol the controller may
+      # need is memcpy, which the compiler emits for a struct copy. The tuning
+      # module additionally calls into the controller, and a soft-float target
+      # pulls in libgcc's __aeabi_* helpers. Anything else means a dependency
+      # has crept in - a libm call, a malloc, a stdio reference.
       - name: Check for unexpected dependencies
         run: |
-          undefined=$(arm-none-eabi-nm -u axxpid.o axxpid_tune.o \
-                      | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | sort -u \
-                      | grep -vE '^(memcpy|axxpid_set_tunings|__aeabi_\w+|__gnu_\w+)$' || true)
-          if [ -n "$undefined" ]; then
-            echo "::error::unexpected external symbols: $undefined"
+          # One object at a time: `nm` prints a filename header when given
+          # several, and the symbol name is the second field, after the type.
+          undefined=$(for obj in axxpid.o axxpid_tune.o; do
+                        arm-none-eabi-nm --undefined-only "$obj" \
+                          | awk '$1 == "U" { print $2 }'
+                      done | sort -u)
+          echo "external symbols: $(echo $undefined)"
+
+          unexpected=$(echo "$undefined" \
+                       | grep -vE '^(memcpy|axxpid_set_tunings|__aeabi_[A-Za-z0-9_]+|__gnu_[A-Za-z0-9_]+)$' \
+                       || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected external symbols: $(echo $unexpected)"
             exit 1
           fi
           echo "no unexpected dependencies"
