@@ -7,7 +7,7 @@ All notable changes to AxxPID are documented here. The format follows
 ## [1.0.0] - 2026-09-28
 
 First release. The control law is the one that has been running in the
-[AxxSolder](https://github.com/AxelJohanssonSWE/AxxSolder) soldering station
+[AxxSolder](https://github.com/AxxAxx/AxxSolder) soldering station
 firmware, extracted into a standalone library and generalised.
 
 ### Carried over from AxxSolder
@@ -150,4 +150,4 @@ biases `Tu` upward by roughly `10·(h/a)` per cent and is not "compensated for"
 in any meaningful sense, and `output_bias` has to be near the true holding
 output or the autotune skews or never starts.
 
-[1.0.0]: https://github.com/axeljohansson/AxxPID/releases/tag/v1.0.0
+[1.0.0]: https://github.com/AxxAxx/AxxPID/releases/tag/v1.0.0

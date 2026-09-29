@@ -124,7 +124,7 @@ Measured with `-Os`, **192 bytes of RAM** per controller and no heap at all:
 | RISC-V rv32imc (no FPU) | 6.3 kB | 4.2 kB |
 
 It is the control loop from the
-[AxxSolder](https://github.com/AxelJohanssonSWE/AxxSolder) soldering station,
+[AxxSolder](https://github.com/AxxAxx/AxxSolder) soldering station,
 pulled out and generalised.
 
 ### Will it run on my chip?
@@ -173,7 +173,7 @@ target_link_libraries(my_firmware PRIVATE axxpid::axxpid)
 **PlatformIO**, in `platformio.ini`:
 
 ```ini
-lib_deps = https://github.com/axeljohansson/AxxPID.git
+lib_deps = https://github.com/AxxAxx/AxxPID.git
 ```
 
 **STM32CubeIDE**: copy `include/axxpid/` and `src/` into the project, add

@@ -2,7 +2,7 @@
  * AxxPID on Arduino: a thermostat driving a heater through a PWM pin.
  *
  * PlatformIO: add to platformio.ini
- *     lib_deps = https://github.com/<you>/AxxPID.git
+ *     lib_deps = https://github.com/AxxAxx/AxxPID.git
  *
  * Arduino IDE: copy include/axxpid/ and src/*.c into
  * ~/Documents/Arduino/libraries/AxxPID/src/ so the layout is

@@ -11,6 +11,10 @@
       "maintainer": true
     }
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AxxAxx/AxxPID.git"
+  },
   "frameworks": "*",
   "platforms": "*",
   "headers": "axxpid/axxpid.h",
