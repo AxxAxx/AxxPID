@@ -13,7 +13,9 @@ Four suites:
 | Suite | Covers |
 |---|---|
 | `test_core` | Lifecycle, argument validation, NULL safety on every entry point, NaN/Inf rejection, tick wraparound, scheduling. |
-| `test_features` | One test per control-law feature, checked against hand-derived arithmetic, plus a regression for every defect found in review. |
+| `test_terms` | The P, I, D and feed-forward terms themselves, each against arithmetic worked out by hand. |
+| `test_limits` | Output limits, slew rate, the integral clamp and the anti-windup strategies. |
+| `test_modes` | Manual and automatic operation, bumpless transfer, retuning, and bad input from a caller or a sensor. |
 | `test_closedloop` | Closed-loop runs against a first-order-plus-dead-time plant: settling, overshoot, disturbance rejection, jitter tolerance, a one-way actuator profile. |
 | `test_tune` | Rule tables against the published coefficients; the relay autotuner against a plant whose true `Ku` and `Tu` are computed numerically in the test. |
 

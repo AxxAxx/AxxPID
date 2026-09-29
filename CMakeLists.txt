@@ -71,7 +71,8 @@ target_compile_options(axxpid PRIVATE ${AXXPID_WARNINGS})
 if(AXXPID_BUILD_TESTS)
     enable_testing()
 
-    set(AXXPID_TESTS test_core test_features test_closedloop)
+    set(AXXPID_TESTS test_core test_terms test_limits test_modes
+                     test_closedloop)
     if(AXXPID_BUILD_TUNE)
         list(APPEND AXXPID_TESTS test_tune)
     endif()
