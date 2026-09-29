@@ -630,7 +630,7 @@ Every rule, the practical notes and the maths are in
 | [docs/TUNING.md](docs/TUNING.md) | Every tuning rule, step tests, autotuner detail. |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config field and every function, as tables. |
 | [docs/CONTROL_LAW.md](docs/CONTROL_LAW.md) | The exact equations and the order they run in. |
-| [docs/BUILDING.md](docs/BUILDING.md) | Building, the test suite, mutation testing, CI. |
+| [docs/BUILDING.md](docs/BUILDING.md) | Building, the test suite, CI, and the invariants to keep if you change the code. |
 | [docs/PORTING_AXXSOLDER.md](docs/PORTING_AXXSOLDER.md) | Moving from the original AxxSolder PID. |
 | `include/axxpid/axxpid.h` | The authoritative reference — every function documented where it is declared. |
 

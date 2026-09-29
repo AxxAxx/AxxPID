@@ -4,6 +4,13 @@
   "description": "Portable, dependency-free PID controller for C. Feed-forward, two-degree-of-freedom setpoint weighting, filtered derivative, selectable anti-windup, bumpless transfer, slew limiting, and a relay autotuner. Extracted from the AxxSolder soldering station firmware.",
   "keywords": ["pid", "control", "controller", "feedforward", "autotune", "pid-controller", "temperature", "motor", "embedded"],
   "license": "MIT",
+  "authors": [
+    {
+      "name": "Axel Johansson",
+      "email": "axeljohansson@duck.com",
+      "maintainer": true
+    }
+  ],
   "frameworks": "*",
   "platforms": "*",
   "headers": "axxpid/axxpid.h",

@@ -4,6 +4,7 @@
 PROJECT_NAME           = "AxxPID"
 PROJECT_NUMBER         = 1.0.0
 PROJECT_BRIEF          = "Portable PID controller for C, with feed-forward"
+# (c) 2026 Axel Johansson, Stockholm, Sweden. MIT licensed.
 
 INPUT                  = include/axxpid src README.md
 FILE_PATTERNS          = *.h *.c *.md
